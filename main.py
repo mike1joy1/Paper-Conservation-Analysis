@@ -6,6 +6,8 @@ scientific comparison and report generation.
 """
 
 import sys
+import os
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -19,7 +21,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from PySide6.QtCore import Qt, QSize, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
+from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -613,7 +615,13 @@ class MainWindow(QMainWindow):
         if not mask_papers:
             return None, None
 
-        return np.logical_and.reduce(mask_papers), np.logical_and.reduce(mask_inks)
+        pm = np.logical_and.reduce(mask_papers)
+        im = np.logical_and.reduce(mask_inks)
+
+        pm = np.repeat(pm[..., np.newaxis], 3, axis=-1)
+        im = np.repeat(im[..., np.newaxis], 3, axis=-1)
+
+        return pm, im
 
     def _display_alignment_image(self):
         """Show one of the three images in the alignment check area."""
@@ -1329,6 +1337,7 @@ class MainWindow(QMainWindow):
 
         self.report = QTextEdit()
         self.report.setReadOnly(True)
+        self.report.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
         self.report.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.report.setPlaceholderText("Analysis summary will appear here.")
         layout.addWidget(self.report)
@@ -1352,7 +1361,7 @@ class MainWindow(QMainWindow):
             blocks.append(block)
 
         separator = f"\n{section_break}\n" if _level == 0 else "\n"
-        return separator.join(blocks)
+        return separator.join(blocks)+"\n"
 
     def analyze_images(self):
         """Run the comparison for the three loaded images and report the result."""
@@ -1361,6 +1370,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Missing input", "Load B1, B2, and A before running the analysis.")
             return
         try:
+
+            #Set up analysis options
+            if self.analysis_options.images_aligned and self.analysis_options.use_masks and self.analysis_options.intersection_mask:
+                paper_mask, ink_mask = self._get_intersection_masks_for_alignment()
+                self.analysis_options.int_paper_mask = paper_mask
+                self.analysis_options.int_ink_mask = ink_mask 
             
             results = compare_images(self.images["B1"], self.images["B2"], self.images["A"], self.analysis_options)
             
@@ -1371,7 +1386,9 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Analysis complete. The report compares B1 against both B2 and A.")
             
         except Exception as exc:
-            QMessageBox.critical(self, "Analysis failed", f"Unable to analyze the images:\n{exc}")
+            exc_type, exc_obj, exc_tb = sys.exc_info()
+            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
+            QMessageBox.critical(self, "Analysis failed", f"Unable to analyze the images:\n{exc}\n\n{traceback.format_exc()}")
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ class analysis_options:
         self.mean_comparison = True
         self.per_pixel_comparison = False
         self.heatmap_grid_size = 50
+        self.dec_places = 1
 
         self.int_paper_mask = None
         self.int_ink_mask = None

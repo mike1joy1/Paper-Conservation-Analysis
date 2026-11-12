@@ -8,13 +8,37 @@ reference image and the comparison images.
 
 from __future__ import annotations
 
+import os
 import numpy as np
+from PIL import Image
 
 from .analysis import compute_deltas, compute_ink_mask
 from .image_state import analysis_options, image_data_colour
 
 __all__ = ["compare_images", "describe_region_change"]
 
+def save_rgb_image(arr, folder, name, ext="png"):
+    """
+    Save a float RGB array (H, W, 3) with values in [0, 1] as an image.
+
+    arr    : np.ndarray, shape (H, W, 3), floats in [0, 1]
+    folder : output directory (created if it doesn't exist)
+    name   : file name, with or without extension
+    ext    : extension used if `name` doesn't already have one
+    """
+    arr = np.asarray(arr)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"Expected shape (H, W, 3), got {arr.shape}")
+
+    # Float [0, 1] -> uint8 [0, 255], clipping stray values and rounding properly
+    img8 = (np.clip(arr, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+    os.makedirs(folder, exist_ok=True)
+    if not os.path.splitext(name)[1]:
+        name = f"{name}.{ext.lstrip('.')}"
+    path = os.path.join(folder, name)
+
+    Image.fromarray(img8, mode="RGB").save(path)
 
 def _as_rgb(image: np.ndarray) -> np.ndarray:
     """Convert any image-like input to a float RGB array in the 0..1 range."""
@@ -93,10 +117,10 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
         "images_aligned": op.images_aligned,
         "mean_comparison": op.mean_comparison,
         "per_pixel_comparison": op.per_pixel_comparison,
-        "heatmap_grid_size": op.heatmap_grid_size
+        "heatmap_grid_size": op.heatmap_grid_size,
+        "dec_places": op.dec_places
     }
 
-    
     # Get masks
     individual_paper_mask = (not op.intersection_mask) or (op.int_paper_mask is None) or (not op.images_aligned)
     individual_ink_mask = (not op.intersection_mask) or (op.int_ink_mask is None) or (not op.images_aligned)
@@ -127,6 +151,7 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
                 "a": op.int_ink_mask
         }
     
+    
     # mask test
     total_pixels = {
         "b1": np.prod(b1.pixels.get("rgb").shape[:2]),
@@ -156,10 +181,13 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
 
     results["Image Data"] = {
         "Before 1": {
+            "Image Array Shape": b1.get_pixels("rgb").shape,
             "Resolution": str(b1.pixels.get("rgb").shape[0]) + "x" + str(b1.pixels.get("rgb").shape[1]),
             "Total Pixels": str(np.prod(b1.pixels.get("rgb").shape[:2])),
+            "Paper Mask Array Shape": paper_mask["b1"].shape,
             "Paper Pixels": str(np.sum(paper_mask["b1"])/3),
             "Paper Percentage": str((np.sum(paper_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
+            "Ink Mask Array Shape": ink_mask["b1"].shape,
             "Ink Pixels": str(np.sum(ink_mask["b1"])/3),
             "Ink Percentage": str((np.sum(ink_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
             "Unused Pixels": str(np.prod(b1.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b1"])/3),
@@ -168,10 +196,13 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
             "Pixels in Both Percentage": str((np.sum(test_intersection_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0)
         },
         "Before 2": {
+            "Image Array Shape": b2.get_pixels("rgb").shape,
             "Resolution": str(b2.pixels.get("rgb").shape[0]) + "x" + str(b2.pixels.get("rgb").shape[1]),
             "Total Pixels": str(np.prod(b2.pixels.get("rgb").shape[:2])),
+            "Paper Mask Array Shape": paper_mask["b2"].shape,
             "Paper Pixels": str(np.sum(paper_mask["b2"])/3),
             "Paper Percentage": str((np.sum(paper_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
+            "Ink Mask Array Shape": ink_mask["b2"].shape,
             "Ink Pixels": str(np.sum(ink_mask["b2"])/3),
             "Ink Percentage": str((np.sum(ink_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
             "Unused Pixels": str(np.prod(b2.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b2"])/3),
@@ -180,10 +211,13 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
             "Pixels in Both Percentage": str((np.sum(test_intersection_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0)
         },
         "After": {
+            "Image Array Shape": a.get_pixels("rgb").shape,
             "Resolution": str(a.pixels.get("rgb").shape[0]) + "x" + str(a.pixels.get("rgb").shape[1]),
             "Total Pixels": str(np.prod(a.pixels.get("rgb").shape[:2])),
+            "Paper Mask Array Shape": paper_mask["a"].shape,
             "Paper Pixels": str(np.sum(paper_mask["a"])/3),
             "Paper Percentage": str((np.sum(paper_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
+            "Ink Mask Array Shape": ink_mask["a"].shape,
             "Ink Pixels": str(np.sum(ink_mask["a"])/3),
             "Ink Percentage": str((np.sum(ink_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
             "Unused Pixels": str(np.prod(a.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["a"])/3),
@@ -192,6 +226,33 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
             "Pixels in Both Percentage": str((np.sum(test_intersection_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0)
         }
     }
+
+    """
+    #debug test save images
+    save_rgb_image(b1.get_pixels("rgb"), "debug", "b1")
+    save_rgb_image(b2.get_pixels("rgb"), "debug", "b2")
+    save_rgb_image(a.get_pixels("rgb"), "debug", "a")
+    save_rgb_image(paper_mask["b1"], "debug", "paper_mask_b1")
+    save_rgb_image(paper_mask["b2"], "debug", "paper_mask_b2")
+    save_rgb_image(paper_mask["a"], "debug", "paper_mask_a")
+    save_rgb_image(ink_mask["b1"], "debug", "ink_mask_b1")
+    save_rgb_image(ink_mask["b2"], "debug", "ink_mask_b2")
+    save_rgb_image(ink_mask["a"], "debug", "ink_mask_a")
+    """
+
+    mask_size_paper = {
+        "b1": np.sum(paper_mask["b1"])/3,
+        "b2": np.sum(paper_mask["b2"])/3,
+        "a": np.sum(paper_mask["a"])/3
+    }
+
+    mask_size_ink = {
+        "b1": np.sum(ink_mask["b1"])/3,
+        "b2": np.sum(ink_mask["b2"])/3,
+        "a": np.sum(ink_mask["a"])/3
+    }
+
+    dec_place = op.dec_places
     
     # RGB comparisons
     if op.rgb_comparison:
@@ -203,20 +264,58 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
         
         # mean comparison
         if op.mean_comparison:
+
+            rgb_paper_only = {
+                "b1": rgb["b1"]*paper_mask["b1"],
+                "b2": rgb["b2"]*paper_mask["b2"],
+                "a": rgb["a"]*paper_mask["a"]
+            }
             
+            """
+            #debug mask apply check
+            save_rgb_image(rgb_paper_only["b1"], "debug", "paper_only_b1")
+            save_rgb_image(rgb_paper_only["b2"], "debug", "paper_only_b2")
+            save_rgb_image(rgb_paper_only["a"], "debug", "paper_only_a")
+            """
+
+            rgb_paper_only_flat = {
+                "b1": rgb_paper_only["b1"].reshape(-1, rgb_paper_only["b1"].shape[-1]),
+                "b2": rgb_paper_only["b2"].reshape(-1, rgb_paper_only["b2"].shape[-1]),
+                "a": rgb_paper_only["a"].reshape(-1, rgb_paper_only["a"].shape[-1])
+            }
+
             rgb_paper_avg = {
-                "b1": np.sum(rgb["b1"]*paper_mask["b1"], axis=(0, 1))/np.sum(paper_mask["b1"], axis=(0, 1)),
-                "b2": np.sum(rgb["b2"]*paper_mask["b2"], axis=(0, 1))/np.sum(paper_mask["b2"], axis=(0, 1)),
-                "a": np.sum(rgb["a"]*paper_mask["a"], axis=(0, 1))/np.sum(paper_mask["a"], axis=(0, 1))
+                "b1": rgb_paper_only_flat["b1"].sum(axis=0, dtype=np.float64)/mask_size_paper["b1"],
+                "b2": rgb_paper_only_flat["b2"].sum(axis=0, dtype=np.float64)/mask_size_paper["b2"],
+                "a": rgb_paper_only_flat["a"].sum(axis=0, dtype=np.float64)/mask_size_paper["a"],
             }
 
             rgb_paper_avg["b_avg"] = (rgb_paper_avg["b1"] + rgb_paper_avg["b2"]) / 2.0
             rgb_paper_avg["b_diff"] = np.abs(rgb_paper_avg["b1"] - rgb_paper_avg["b2"])
 
+            rgb_ink_only = {
+                "b1": rgb["b1"]*ink_mask["b1"],
+                "b2": rgb["b2"]*ink_mask["b2"],
+                "a": rgb["a"]*ink_mask["a"]
+            }
+
+            """
+            #debug mask apply check
+            save_rgb_image(rgb_ink_only["b1"], "debug", "ink_only_b1")
+            save_rgb_image(rgb_ink_only["b2"], "debug", "ink_only_b2")
+            save_rgb_image(rgb_ink_only["a"], "debug", "ink_only_a")
+            """
+
+            rgb_ink_only_flat = {
+                "b1": rgb_ink_only["b1"].reshape(-1, rgb_ink_only["b1"].shape[-1]),
+                "b2": rgb_ink_only["b2"].reshape(-1, rgb_ink_only["b2"].shape[-1]),
+                "a": rgb_ink_only["a"].reshape(-1, rgb_ink_only["a"].shape[-1])
+            }
+
             rgb_ink_avg = {
-                "b1": np.sum(rgb["b1"]*ink_mask["b1"], axis=(0, 1))/np.sum(ink_mask["b1"], axis=(0, 1)),
-                "b2": np.sum(rgb["b2"]*ink_mask["b2"], axis=(0, 1))/np.sum(ink_mask["b2"], axis=(0, 1)),
-                "a": np.sum(rgb["a"]*ink_mask["a"], axis=(0, 1))/np.sum(ink_mask["a"], axis=(0, 1))
+                "b1": rgb_ink_only_flat["b1"].sum(axis=0, dtype=np.float64)/mask_size_ink["b1"],
+                "b2": rgb_ink_only_flat["b2"].sum(axis=0, dtype=np.float64)/mask_size_ink["b2"],
+                "a": rgb_ink_only_flat["a"].sum(axis=0, dtype=np.float64)/mask_size_ink["a"],
             }
 
             rgb_ink_avg["b_avg"] = (rgb_ink_avg["b1"] + rgb_ink_avg["b2"]) / 2.0
@@ -260,40 +359,45 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
                     }
                 }
             }
-            
+
+            # convert to 0-100 scale for RGB
+            for k in rgb_paper_avg: rgb_paper_avg[k] *= 100
+            for k in rgb_ink_avg: rgb_ink_avg[k] *= 100
+
             results["RGB Average"] = {
+                "(Scale": "0-100)",
                 "Paper": {
-                    "Before Average": {
-                        "R": str(rgb_paper_avg["b_avg"][0])+" +-"+str(rgb_paper_avg["b_diff"][0]/2.0),
-                        "G": str(rgb_paper_avg["b_avg"][1])+" +-"+str(rgb_paper_avg["b_diff"][1]/2.0),
-                        "B": str(rgb_paper_avg["b_avg"][2])+" +-"+str(rgb_paper_avg["b_diff"][2]/2.0)
+                    "Before": {
+                        "R": f"{rgb_paper_avg["b_avg"][0]:.{dec_place}f} ±{rgb_paper_avg["b_diff"][0]/2.0:.{dec_place}f}",
+                        "G": f"{rgb_paper_avg["b_avg"][1]:.{dec_place}f} ±{rgb_paper_avg["b_diff"][1]/2.0:.{dec_place}f}",
+                        "B": f"{rgb_paper_avg["b_avg"][2]:.{dec_place}f} ±{rgb_paper_avg["b_diff"][2]/2.0:.{dec_place}f}"
                     },
-                    "After Average": {
-                        "R": str(rgb_paper_avg["a"][0]),
-                        "G": str(rgb_paper_avg["a"][1]),
-                        "B": str(rgb_paper_avg["a"][2])
+                    "After": {
+                        "R": f"{rgb_paper_avg["a"][0]:.{dec_place}f}",
+                        "G": f"{rgb_paper_avg["a"][1]:.{dec_place}f}",
+                        "B": f"{rgb_paper_avg["a"][2]:.{dec_place}f}"
                     },
                     "Difference": {
-                        "R": str(rgb_paper_avg["a"][0]-rgb_paper_avg["b_avg"][0])+" +-"+str(rgb_paper_avg["b_diff"][0]/2.0),
-                        "G": str(rgb_paper_avg["a"][1]-rgb_paper_avg["b_avg"][1])+" +-"+str(rgb_paper_avg["b_diff"][1]/2.0),
-                        "B": str(rgb_paper_avg["a"][2]-rgb_paper_avg["b_avg"][2])+" +-"+str(rgb_paper_avg["b_diff"][2]/2.0)
+                        "R": f"{rgb_paper_avg["a"][0]-rgb_paper_avg["b_avg"][0]:+.{dec_place}f} ±{rgb_paper_avg["b_diff"][0]/2.0:.{dec_place}f}",
+                        "G": f"{rgb_paper_avg["a"][1]-rgb_paper_avg["b_avg"][1]:+.{dec_place}f} ±{rgb_paper_avg["b_diff"][1]/2.0:.{dec_place}f}",
+                        "B": f"{rgb_paper_avg["a"][2]-rgb_paper_avg["b_avg"][2]:+.{dec_place}f} ±{rgb_paper_avg["b_diff"][2]/2.0:.{dec_place}f}"
                     }
                 },
                 "Ink": {
-                    "Before Average": {
-                        "R": str(rgb_ink_avg["b_avg"][0])+" +-"+str(rgb_ink_avg["b_diff"][0]/2.0),
-                        "G": str(rgb_ink_avg["b_avg"][1])+" +-"+str(rgb_ink_avg["b_diff"][1]/2.0),
-                        "B": str(rgb_ink_avg["b_avg"][2])+" +-"+str(rgb_ink_avg["b_diff"][2]/2.0)
+                    "Before": {
+                        "R": f"{rgb_ink_avg["b_avg"][0]:.{dec_place}f} ±{rgb_ink_avg["b_diff"][0]/2.0:.{dec_place}f}",
+                        "G": f"{rgb_ink_avg["b_avg"][1]:.{dec_place}f} ±{rgb_ink_avg["b_diff"][1]/2.0:.{dec_place}f}",
+                        "B": f"{rgb_ink_avg["b_avg"][2]:.{dec_place}f} ±{rgb_ink_avg["b_diff"][2]/2.0:.{dec_place}f}"
                     },
-                    "After Average": {
-                        "R": str(rgb_ink_avg["a"][0]),
-                        "G": str(rgb_ink_avg["a"][1]),
-                        "B": str(rgb_ink_avg["a"][2])
+                    "After": {
+                        "R": f"{rgb_ink_avg["a"][0]:.{dec_place}f}",
+                        "G": f"{rgb_ink_avg["a"][1]:.{dec_place}f}",
+                        "B": f"{rgb_ink_avg["a"][2]:.{dec_place}f}"
                     },
                     "Difference": {
-                        "R": str(rgb_ink_avg["a"][0]-rgb_ink_avg["b_avg"][0])+" +-"+str(rgb_ink_avg["b_diff"][0]/2.0),
-                        "G": str(rgb_ink_avg["a"][1]-rgb_ink_avg["b_avg"][1])+" +-"+str(rgb_ink_avg["b_diff"][1]/2.0),
-                        "B": str(rgb_ink_avg["a"][2]-rgb_ink_avg["b_avg"][2])+" +-"+str(rgb_ink_avg["b_diff"][2]/2.0)
+                        "R": f"{rgb_ink_avg["a"][0]-rgb_ink_avg["b_avg"][0]:+.{dec_place}f} ±{rgb_ink_avg["b_diff"][0]/2.0:.{dec_place}f}",
+                        "G": f"{rgb_ink_avg["a"][1]-rgb_ink_avg["b_avg"][1]:+.{dec_place}f} ±{rgb_ink_avg["b_diff"][1]/2.0:.{dec_place}f}",
+                        "B": f"{rgb_ink_avg["a"][2]-rgb_ink_avg["b_avg"][2]:+.{dec_place}f} ±{rgb_ink_avg["b_diff"][2]/2.0:.{dec_place}f}"
                     }
                 }
             }
@@ -302,58 +406,133 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
         # Per-pixel comparison (todo)
 
     # LAB comparisons
-    
+    if op.lab_comparison:
+        lab = {
+            "b1": b1.get_pixels("lab"),
+            "b2": b2.get_pixels("lab"),
+            "a": a.get_pixels("lab")
+        }
+        
+        # mean comparison
+        if op.mean_comparison:
+
+            lab_paper_only = {
+                "b1": lab["b1"]*paper_mask["b1"],
+                "b2": lab["b2"]*paper_mask["b2"],
+                "a": lab["a"]*paper_mask["a"]
+            }
+
+            lab_paper_only_flat = {
+                "b1": lab_paper_only["b1"].reshape(-1, lab_paper_only["b1"].shape[-1]),
+                "b2": lab_paper_only["b2"].reshape(-1, lab_paper_only["b2"].shape[-1]),
+                "a": lab_paper_only["a"].reshape(-1, lab_paper_only["a"].shape[-1])
+            }
+
+            lab_paper_avg = {
+                "b1": lab_paper_only_flat["b1"].sum(axis=0, dtype=np.float64)/mask_size_paper["b1"],
+                "b2": lab_paper_only_flat["b2"].sum(axis=0, dtype=np.float64)/mask_size_paper["b2"],
+                "a": lab_paper_only_flat["a"].sum(axis=0, dtype=np.float64)/mask_size_paper["a"],
+            }
+
+            lab_paper_avg["b_avg"] = (lab_paper_avg["b1"] + lab_paper_avg["b2"]) / 2.0
+            lab_paper_avg["b_diff"] = np.abs(lab_paper_avg["b1"] - lab_paper_avg["b2"])
+
+            lab_ink_only = {
+                "b1": lab["b1"]*ink_mask["b1"],
+                "b2": lab["b2"]*ink_mask["b2"],
+                "a": lab["a"]*ink_mask["a"]
+            }
+
+            lab_ink_only_flat = {
+                "b1": lab_ink_only["b1"].reshape(-1, lab_ink_only["b1"].shape[-1]),
+                "b2": lab_ink_only["b2"].reshape(-1, lab_ink_only["b2"].shape[-1]),
+                "a": lab_ink_only["a"].reshape(-1, lab_ink_only["a"].shape[-1])
+            }
+
+            lab_ink_avg = {
+                "b1": lab_ink_only_flat["b1"].sum(axis=0, dtype=np.float64)/mask_size_ink["b1"],
+                "b2": lab_ink_only_flat["b2"].sum(axis=0, dtype=np.float64)/mask_size_ink["b2"],
+                "a": lab_ink_only_flat["a"].sum(axis=0, dtype=np.float64)/mask_size_ink["a"],
+            }
+
+            lab_ink_avg["b_avg"] = (lab_ink_avg["b1"] + lab_ink_avg["b2"]) / 2.0
+            lab_ink_avg["b_diff"] = np.abs(lab_ink_avg["b1"] - lab_ink_avg["b2"])
+
+            lab_raw_results = {
+                "b1": {
+                    "paper": {
+                        "l": lab_paper_avg["b1"][0],
+                        "a": lab_paper_avg["b1"][1],
+                        "b": lab_paper_avg["b1"][2]
+                    },
+                    "ink": {
+                        "l": lab_ink_avg["b1"][0],
+                        "a": lab_ink_avg["b1"][1],
+                        "b": lab_ink_avg["b1"][2]
+                    }
+                },
+                "b2": {
+                    "paper": {
+                        "l": lab_paper_avg["b2"][0],
+                        "a": lab_paper_avg["b2"][1],
+                        "b": lab_paper_avg["b2"][2]
+                    },
+                    "ink": {
+                        "l": lab_ink_avg["b2"][0],
+                        "a": lab_ink_avg["b2"][1],
+                        "b": lab_ink_avg["b2"][2]
+                    }
+                },
+                "a": {
+                    "paper": {
+                        "l": lab_paper_avg["a"][0],
+                        "a": lab_paper_avg["a"][1],
+                        "b": lab_paper_avg["a"][2]
+                    },
+                    "ink": {
+                        "l": lab_ink_avg["a"][0],
+                        "a": lab_ink_avg["a"][1],
+                        "b": lab_ink_avg["a"][2]
+                    }
+                }
+            }
+
+            results["LAB Average"] = {
+                "(Scale": "0-100)",
+                "Paper": {
+                    "Before": {
+                        "L*": f"{lab_paper_avg["b_avg"][0]:.{dec_place}f} ±{lab_paper_avg["b_diff"][0]/2.0:.{dec_place}f}",
+                        "a*": f"{lab_paper_avg["b_avg"][1]:.{dec_place}f} ±{lab_paper_avg["b_diff"][1]/2.0:.{dec_place}f}",
+                        "b*": f"{lab_paper_avg["b_avg"][2]:.{dec_place}f} ±{lab_paper_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                    },
+                    "After": {
+                        "L*": f"{lab_paper_avg["a"][0]:.{dec_place}f}",
+                        "a*": f"{lab_paper_avg["a"][1]:.{dec_place}f}",
+                        "b*": f"{lab_paper_avg["a"][2]:.{dec_place}f}"
+                    },
+                    "Difference": {
+                        "L*": f"{lab_paper_avg["a"][0]-lab_paper_avg["b_avg"][0]:+.{dec_place}f} ±{lab_paper_avg["b_diff"][0]/2.0:.{dec_place}f}",
+                        "a*": f"{lab_paper_avg["a"][1]-lab_paper_avg["b_avg"][1]:+.{dec_place}f} ±{lab_paper_avg["b_diff"][1]/2.0:.{dec_place}f}",
+                        "b*": f"{lab_paper_avg["a"][2]-lab_paper_avg["b_avg"][2]:+.{dec_place}f} ±{lab_paper_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                    }
+                },
+                "Ink": {
+                    "Before": {
+                        "L*": f"{lab_ink_avg["b_avg"][0]:.{dec_place}f} ±{lab_ink_avg["b_diff"][0]/2.0:.{dec_place}f}",
+                        "a*": f"{lab_ink_avg["b_avg"][1]:.{dec_place}f} ±{lab_ink_avg["b_diff"][1]/2.0:.{dec_place}f}",
+                        "b*": f"{lab_ink_avg["b_avg"][2]:.{dec_place}f} ±{lab_ink_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                    },
+                    "After": {
+                        "L*": f"{lab_ink_avg["a"][0]:.{dec_place}f}",
+                        "a*": f"{lab_ink_avg["a"][1]:.{dec_place}f}",
+                        "b*": f"{lab_ink_avg["a"][2]:.{dec_place}f}"
+                    },
+                    "Difference": {
+                        "L*": f"{lab_ink_avg["a"][0]-lab_ink_avg["b_avg"][0]:+.{dec_place}f} ±{lab_ink_avg["b_diff"][0]/2.0:.{dec_place}f}",
+                        "a*": f"{lab_ink_avg["a"][1]-lab_ink_avg["b_avg"][1]:+.{dec_place}f} ±{lab_ink_avg["b_diff"][1]/2.0:.{dec_place}f}",
+                        "b*": f"{lab_ink_avg["a"][2]-lab_ink_avg["b_avg"][2]:+.{dec_place}f} ±{lab_ink_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                    }
+                }
+            }
+
     return results
-
-    # ref = _as_rgb(b1)
-    # base_img = _as_rgb(b2)
-    # test_img = _as_rgb(a)
-
-    # if ref.shape != base_img.shape or ref.shape != test_img.shape:
-    #     raise ValueError("B1, B2, and A must all have matching widths, heights, and channels.")
-
-    # # Build the mask once from the reference image and reuse it for both comparisons.
-    # ink_mask = compute_ink_mask(ref)
-    # paper_mask = ~ink_mask
-
-    # # B1 vs B2 is the baseline reference noise; B1 vs A is the treatment change.
-    # base_diff = compute_deltas(ref, base_img)
-    # test_diff = compute_deltas(ref, test_img)
-
-    # # Keep the raw numbers visible, but also attach the Lab-direction metrics used in
-    # # the human-readable report so the meaning of the result is clear.
-    # base_paper = _summarize_metric_map(base_diff["dE00"][paper_mask])
-    # base_paper["dL_median"] = float(np.median(base_diff["dL"][paper_mask])) if np.any(paper_mask) else 0.0
-    # base_paper["db_median"] = float(np.median(base_diff["db"][paper_mask])) if np.any(paper_mask) else 0.0
-    # base_ink = _summarize_metric_map(base_diff["dE00"][ink_mask])
-    # base_ink["dL_median"] = float(np.median(base_diff["dL"][ink_mask])) if np.any(ink_mask) else 0.0
-    # base_ink["db_median"] = float(np.median(base_diff["db"][ink_mask])) if np.any(ink_mask) else 0.0
-
-    # test_paper = _summarize_metric_map(test_diff["dE00"][paper_mask])
-    # test_paper["dL_median"] = float(np.median(test_diff["dL"][paper_mask])) if np.any(paper_mask) else 0.0
-    # test_paper["db_median"] = float(np.median(test_diff["db"][paper_mask])) if np.any(paper_mask) else 0.0
-    # test_ink = _summarize_metric_map(test_diff["dE00"][ink_mask])
-    # test_ink["dL_median"] = float(np.median(test_diff["dL"][ink_mask])) if np.any(ink_mask) else 0.0
-    # test_ink["db_median"] = float(np.median(test_diff["db"][ink_mask])) if np.any(ink_mask) else 0.0
-
-    # valid_mask = paper_mask | ink_mask
-    # base_score = float(np.mean(base_diff["dE00"][valid_mask])) if np.any(valid_mask) else 0.0
-    # test_score = float(np.mean(test_diff["dE00"][valid_mask])) if np.any(valid_mask) else 0.0
-    
-    # return {
-    #     "base": {
-    #         "reference": ref,
-    #         "aligned": base_img,
-    #         "score": base_score,
-    #         "paper": base_paper,
-    #         "ink": base_ink,
-    #     },
-    #     "test": {
-    #         "reference": ref,
-    #         "aligned": test_img,
-    #         "score": test_score,
-    #         "paper": test_paper,
-    #         "ink": test_ink,
-    #     },
-    
-    
