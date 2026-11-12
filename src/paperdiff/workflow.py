@@ -360,44 +360,44 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
                 }
             }
 
-            # convert to 0-100 scale for RGB
-            for k in rgb_paper_avg: rgb_paper_avg[k] *= 100
-            for k in rgb_ink_avg: rgb_ink_avg[k] *= 100
+            rgb_scale = 100.0
+            for k in rgb_paper_avg: rgb_paper_avg[k] *= rgb_scale
+            for k in rgb_ink_avg: rgb_ink_avg[k] *= rgb_scale
 
             results["RGB Average"] = {
-                "(Scale": "0-100)",
+                "(Scale": f"{0.0:.{dec_place}f} to {rgb_scale:.{dec_place}f})",
                 "Paper": {
                     "Before": {
-                        "R": f"{rgb_paper_avg["b_avg"][0]:.{dec_place}f} ±{rgb_paper_avg["b_diff"][0]/2.0:.{dec_place}f}",
-                        "G": f"{rgb_paper_avg["b_avg"][1]:.{dec_place}f} ±{rgb_paper_avg["b_diff"][1]/2.0:.{dec_place}f}",
-                        "B": f"{rgb_paper_avg["b_avg"][2]:.{dec_place}f} ±{rgb_paper_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                        "R": f"{rgb_paper_avg["b_avg"][0]:{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
+                        "G": f"{rgb_paper_avg["b_avg"][1]:{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
+                        "B": f"{rgb_paper_avg["b_avg"][2]:{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
                     },
                     "After": {
-                        "R": f"{rgb_paper_avg["a"][0]:.{dec_place}f}",
-                        "G": f"{rgb_paper_avg["a"][1]:.{dec_place}f}",
-                        "B": f"{rgb_paper_avg["a"][2]:.{dec_place}f}"
+                        "R": f"{rgb_paper_avg["a"][0]:{4+dec_place}.{dec_place}f}",
+                        "G": f"{rgb_paper_avg["a"][1]:{4+dec_place}.{dec_place}f}",
+                        "B": f"{rgb_paper_avg["a"][2]:{4+dec_place}.{dec_place}f}"
                     },
                     "Difference": {
-                        "R": f"{rgb_paper_avg["a"][0]-rgb_paper_avg["b_avg"][0]:+.{dec_place}f} ±{rgb_paper_avg["b_diff"][0]/2.0:.{dec_place}f}",
-                        "G": f"{rgb_paper_avg["a"][1]-rgb_paper_avg["b_avg"][1]:+.{dec_place}f} ±{rgb_paper_avg["b_diff"][1]/2.0:.{dec_place}f}",
-                        "B": f"{rgb_paper_avg["a"][2]-rgb_paper_avg["b_avg"][2]:+.{dec_place}f} ±{rgb_paper_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                        "R": f"{rgb_paper_avg["a"][0]-rgb_paper_avg["b_avg"][0]:+{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
+                        "G": f"{rgb_paper_avg["a"][1]-rgb_paper_avg["b_avg"][1]:+{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
+                        "B": f"{rgb_paper_avg["a"][2]-rgb_paper_avg["b_avg"][2]:+{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
                     }
                 },
                 "Ink": {
                     "Before": {
-                        "R": f"{rgb_ink_avg["b_avg"][0]:.{dec_place}f} ±{rgb_ink_avg["b_diff"][0]/2.0:.{dec_place}f}",
-                        "G": f"{rgb_ink_avg["b_avg"][1]:.{dec_place}f} ±{rgb_ink_avg["b_diff"][1]/2.0:.{dec_place}f}",
-                        "B": f"{rgb_ink_avg["b_avg"][2]:.{dec_place}f} ±{rgb_ink_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                        "R": f"{rgb_ink_avg["b_avg"][0]:{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
+                        "G": f"{rgb_ink_avg["b_avg"][1]:{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
+                        "B": f"{rgb_ink_avg["b_avg"][2]:{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
                     },
                     "After": {
-                        "R": f"{rgb_ink_avg["a"][0]:.{dec_place}f}",
-                        "G": f"{rgb_ink_avg["a"][1]:.{dec_place}f}",
-                        "B": f"{rgb_ink_avg["a"][2]:.{dec_place}f}"
+                        "R": f"{rgb_ink_avg["a"][0]:{4+dec_place}.{dec_place}f}",
+                        "G": f"{rgb_ink_avg["a"][1]:{4+dec_place}.{dec_place}f}",
+                        "B": f"{rgb_ink_avg["a"][2]:{4+dec_place}.{dec_place}f}"
                     },
                     "Difference": {
-                        "R": f"{rgb_ink_avg["a"][0]-rgb_ink_avg["b_avg"][0]:+.{dec_place}f} ±{rgb_ink_avg["b_diff"][0]/2.0:.{dec_place}f}",
-                        "G": f"{rgb_ink_avg["a"][1]-rgb_ink_avg["b_avg"][1]:+.{dec_place}f} ±{rgb_ink_avg["b_diff"][1]/2.0:.{dec_place}f}",
-                        "B": f"{rgb_ink_avg["a"][2]-rgb_ink_avg["b_avg"][2]:+.{dec_place}f} ±{rgb_ink_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                        "R": f"{rgb_ink_avg["a"][0]-rgb_ink_avg["b_avg"][0]:+{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
+                        "G": f"{rgb_ink_avg["a"][1]-rgb_ink_avg["b_avg"][1]:+{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
+                        "B": f"{rgb_ink_avg["a"][2]-rgb_ink_avg["b_avg"][2]:+{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
                     }
                 }
             }
@@ -497,40 +497,44 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
                 }
             }
 
+            lab_scale = 100.0
+            for k in lab_paper_avg: lab_paper_avg[k] *= lab_scale/100.0
+            for k in lab_ink_avg: lab_ink_avg[k] *= lab_scale/100.0
+
             results["LAB Average"] = {
-                "(Scale": "0-100)",
+                "(Scale": f"{-lab_scale:.{dec_place}f} to {lab_scale:.{dec_place}f})",
                 "Paper": {
                     "Before": {
-                        "L*": f"{lab_paper_avg["b_avg"][0]:.{dec_place}f} ±{lab_paper_avg["b_diff"][0]/2.0:.{dec_place}f}",
-                        "a*": f"{lab_paper_avg["b_avg"][1]:.{dec_place}f} ±{lab_paper_avg["b_diff"][1]/2.0:.{dec_place}f}",
-                        "b*": f"{lab_paper_avg["b_avg"][2]:.{dec_place}f} ±{lab_paper_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                        "L*": f"{lab_paper_avg["b_avg"][0]:{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
+                        "a*": f"{lab_paper_avg["b_avg"][1]:{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
+                        "b*": f"{lab_paper_avg["b_avg"][2]:{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
                     },
                     "After": {
-                        "L*": f"{lab_paper_avg["a"][0]:.{dec_place}f}",
-                        "a*": f"{lab_paper_avg["a"][1]:.{dec_place}f}",
-                        "b*": f"{lab_paper_avg["a"][2]:.{dec_place}f}"
+                        "L*": f"{lab_paper_avg["a"][0]:{4+dec_place}.{dec_place}f}",
+                        "a*": f"{lab_paper_avg["a"][1]:{4+dec_place}.{dec_place}f}",
+                        "b*": f"{lab_paper_avg["a"][2]:{4+dec_place}.{dec_place}f}"
                     },
                     "Difference": {
-                        "L*": f"{lab_paper_avg["a"][0]-lab_paper_avg["b_avg"][0]:+.{dec_place}f} ±{lab_paper_avg["b_diff"][0]/2.0:.{dec_place}f}",
-                        "a*": f"{lab_paper_avg["a"][1]-lab_paper_avg["b_avg"][1]:+.{dec_place}f} ±{lab_paper_avg["b_diff"][1]/2.0:.{dec_place}f}",
-                        "b*": f"{lab_paper_avg["a"][2]-lab_paper_avg["b_avg"][2]:+.{dec_place}f} ±{lab_paper_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                        "L*": f"{lab_paper_avg["a"][0]-lab_paper_avg["b_avg"][0]:+{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
+                        "a*": f"{lab_paper_avg["a"][1]-lab_paper_avg["b_avg"][1]:+{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
+                        "b*": f"{lab_paper_avg["a"][2]-lab_paper_avg["b_avg"][2]:+{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
                     }
                 },
                 "Ink": {
                     "Before": {
-                        "L*": f"{lab_ink_avg["b_avg"][0]:.{dec_place}f} ±{lab_ink_avg["b_diff"][0]/2.0:.{dec_place}f}",
-                        "a*": f"{lab_ink_avg["b_avg"][1]:.{dec_place}f} ±{lab_ink_avg["b_diff"][1]/2.0:.{dec_place}f}",
-                        "b*": f"{lab_ink_avg["b_avg"][2]:.{dec_place}f} ±{lab_ink_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                        "L*": f"{lab_ink_avg["b_avg"][0]:{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
+                        "a*": f"{lab_ink_avg["b_avg"][1]:{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
+                        "b*": f"{lab_ink_avg["b_avg"][2]:{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
                     },
                     "After": {
-                        "L*": f"{lab_ink_avg["a"][0]:.{dec_place}f}",
-                        "a*": f"{lab_ink_avg["a"][1]:.{dec_place}f}",
-                        "b*": f"{lab_ink_avg["a"][2]:.{dec_place}f}"
+                        "L*": f"{lab_ink_avg["a"][0]:{4+dec_place}.{dec_place}f}",
+                        "a*": f"{lab_ink_avg["a"][1]:{4+dec_place}.{dec_place}f}",
+                        "b*": f"{lab_ink_avg["a"][2]:{4+dec_place}.{dec_place}f}"
                     },
                     "Difference": {
-                        "L*": f"{lab_ink_avg["a"][0]-lab_ink_avg["b_avg"][0]:+.{dec_place}f} ±{lab_ink_avg["b_diff"][0]/2.0:.{dec_place}f}",
-                        "a*": f"{lab_ink_avg["a"][1]-lab_ink_avg["b_avg"][1]:+.{dec_place}f} ±{lab_ink_avg["b_diff"][1]/2.0:.{dec_place}f}",
-                        "b*": f"{lab_ink_avg["a"][2]-lab_ink_avg["b_avg"][2]:+.{dec_place}f} ±{lab_ink_avg["b_diff"][2]/2.0:.{dec_place}f}"
+                        "L*": f"{lab_ink_avg["a"][0]-lab_ink_avg["b_avg"][0]:+{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
+                        "a*": f"{lab_ink_avg["a"][1]-lab_ink_avg["b_avg"][1]:+{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
+                        "b*": f"{lab_ink_avg["a"][2]-lab_ink_avg["b_avg"][2]:+{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
                     }
                 }
             }

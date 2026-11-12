@@ -1337,7 +1337,9 @@ class MainWindow(QMainWindow):
 
         self.report = QTextEdit()
         self.report.setReadOnly(True)
-        self.report.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        report_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        report_font.setPointSize(10)
+        self.report.setFont(report_font)
         self.report.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.report.setPlaceholderText("Analysis summary will appear here.")
         layout.addWidget(self.report)
@@ -1361,7 +1363,7 @@ class MainWindow(QMainWindow):
             blocks.append(block)
 
         separator = f"\n{section_break}\n" if _level == 0 else "\n"
-        return separator.join(blocks)+"\n"
+        return separator.join(blocks)
 
     def analyze_images(self):
         """Run the comparison for the three loaded images and report the result."""
@@ -1379,9 +1381,9 @@ class MainWindow(QMainWindow):
             
             results = compare_images(self.images["B1"], self.images["B2"], self.images["A"], self.analysis_options)
             
-            summary_lines = self.dict_to_string(results,indent=" "*6, section_break="\n"+("-" * 64)+"\n")
+            summary_lines = self.dict_to_string(results,indent=" "*4, section_break="\n"+("-" * 64)+"\n")
 
-            self.report.setPlainText(summary_lines)
+            self.report.setPlainText(summary_lines+"\n")
             
             self.status_label.setText("Analysis complete. The report compares B1 against both B2 and A.")
             
