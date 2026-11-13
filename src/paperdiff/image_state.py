@@ -20,7 +20,8 @@ class analysis_options:
         self.images_aligned = False
         self.mean_comparison = True
         self.per_pixel_comparison = False
-        self.heatmap_grid_size = 50
+        self.heatmap_grid_size_x = 50
+        self.heatmap_grid_size_y = 50
         self.dec_places = 1
 
         self.int_paper_mask = None
@@ -35,7 +36,8 @@ class analysis_options:
             "images_aligned": self.images_aligned,
             "mean_comparison": self.mean_comparison,
             "per_pixel_comparison": self.per_pixel_comparison,
-            "heatmap_grid_size": self.heatmap_grid_size,
+            "heatmap_grid_size_x": self.heatmap_grid_size_x,
+            "heatmap_grid_size_y": self.heatmap_grid_size_y,
         }
         return f"analysis_options({details})"
 

@@ -1202,10 +1202,16 @@ class MainWindow(QMainWindow):
                 widget.setChecked(value)
                 widget.blockSignals(False)
 
-        if hasattr(self, "heatmap_grid_slider"):
-            slider = self.heatmap_grid_slider
+        if hasattr(self, "heatmap_grid_slider_x"):
+            slider = self.heatmap_grid_slider_x
             slider.blockSignals(True)
-            slider.setValue(options.heatmap_grid_size)
+            slider.setValue(options.heatmap_grid_size_x)
+            slider.blockSignals(False)
+
+        if hasattr(self, "heatmap_grid_slider_y"):
+            slider = self.heatmap_grid_slider_y
+            slider.blockSignals(True)
+            slider.setValue(options.heatmap_grid_size_y)
             slider.blockSignals(False)
 
         intersection_enabled = options.use_masks and options.images_aligned
@@ -1228,11 +1234,17 @@ class MainWindow(QMainWindow):
                 self.per_pixel_comparison_checkbox.blockSignals(False)
             self.per_pixel_comparison_checkbox.setEnabled(per_pixel_enabled)
 
-        if hasattr(self, "heatmap_grid_slider"):
+        if hasattr(self, "heatmap_grid_slider_x"):
             if not heatmap_enabled:
-                self.heatmap_grid_slider.setEnabled(False)
+                self.heatmap_grid_slider_x.setEnabled(False)
             else:
-                self.heatmap_grid_slider.setEnabled(True)
+                self.heatmap_grid_slider_x.setEnabled(True)
+        
+        if hasattr(self, "heatmap_grid_slider_y"):
+            if not heatmap_enabled:
+                self.heatmap_grid_slider_y.setEnabled(False)
+            else:
+                self.heatmap_grid_slider_y.setEnabled(True)
 
     def _create_analysis_options_tab(self):
         """Tab 4: collect comparison and masking settings for later analysis."""
@@ -1296,19 +1308,33 @@ class MainWindow(QMainWindow):
         )
         options_layout.addWidget(self.per_pixel_comparison_checkbox)
 
-        self.heatmap_grid_slider = QSlider(Qt.Horizontal)
-        self.heatmap_grid_slider.setRange(1, 100)
-        self.heatmap_grid_slider.setValue(self.analysis_options.heatmap_grid_size)
-        self.heatmap_grid_slider.valueChanged.connect(
-            lambda value: self.analysis_options.sync_from_ui(heatmap_grid_size=value)
+        self.heatmap_grid_slider_x = QSlider(Qt.Horizontal)
+        self.heatmap_grid_slider_x.setRange(2, 1000)
+        self.heatmap_grid_slider_x.setValue(self.analysis_options.heatmap_grid_size_x)
+        self.heatmap_grid_slider_x.valueChanged.connect(
+            lambda value: self.analysis_options.sync_from_ui(heatmap_grid_size_x=value)
         )
 
-        heatmap_label = QLabel(f"Heatmap grid size: {self.analysis_options.heatmap_grid_size}px")
-        self.heatmap_grid_slider.valueChanged.connect(
-            lambda value: heatmap_label.setText(f"Heatmap grid size: {value}px")
+        heatmap_label_x = QLabel(f"Heatmap grid divisions: {self.analysis_options.heatmap_grid_size_x}")
+        self.heatmap_grid_slider_x.valueChanged.connect(
+            lambda value: heatmap_label_x.setText(f"Heatmap x divisions: {value}")
         )
-        options_layout.addWidget(heatmap_label)
-        options_layout.addWidget(self.heatmap_grid_slider)
+        options_layout.addWidget(heatmap_label_x)
+        options_layout.addWidget(self.heatmap_grid_slider_x)
+
+        self.heatmap_grid_slider_y = QSlider(Qt.Horizontal)
+        self.heatmap_grid_slider_y.setRange(2, 1000)
+        self.heatmap_grid_slider_y.setValue(self.analysis_options.heatmap_grid_size_y)
+        self.heatmap_grid_slider_y.valueChanged.connect(
+            lambda value: self.analysis_options.sync_from_ui(heatmap_grid_size_y=value)
+        )
+
+        heatmap_label_y = QLabel(f"Heatmap grid divisions: {self.analysis_options.heatmap_grid_size_y}")
+        self.heatmap_grid_slider_y.valueChanged.connect(
+            lambda value: heatmap_label_y.setText(f"Heatmap y divisions: {value}")
+        )
+        options_layout.addWidget(heatmap_label_y)
+        options_layout.addWidget(self.heatmap_grid_slider_y)
 
         layout.addWidget(options_group)
         self._refresh_analysis_options_state()
