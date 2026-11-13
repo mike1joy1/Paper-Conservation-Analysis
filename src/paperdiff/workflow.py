@@ -16,7 +16,7 @@ from skimage.color import deltaE_ciede94, deltaE_ciede2000, deltaE_cmc
 from .analysis import compute_deltas, compute_ink_mask
 from .image_state import analysis_options, image_data_colour
 
-__all__ = ["compare_images", "describe_region_change"]
+__all__ = ["image_analysis_b1_b2_a", "describe_region_change"]
 
 def save_rgb_image(arr, folder, name, ext="png"):
     """
@@ -161,7 +161,100 @@ def describe_region_change(metrics: dict[str, float], region_name: str = "region
     )
 
 
-def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_colour, op: analysis_options) -> dict:
+def image_avg(image, mask):
+    ms = np.sum(mask)/3
+    im = image*mask
+
+    if ms == 0:
+        return im.reshape(-1, im.shape[-1]).sum(axis=0, dtype=np.float64)*0
+    else:
+        return im.reshape(-1, im.shape[-1]).sum(axis=0, dtype=np.float64)/ms
+
+
+def grid_averages(image_tiles, mask_tiles):
+    """
+    Returns shape (y, x, 3)
+    """
+    y = len(image_tiles)
+    x = len(image_tiles[0])
+    
+    out = np.empty((y, x, 3))
+
+    for j in range(y):
+        for i in range(x):
+            out[j, i] = image_avg(image_tiles[j][i], mask_tiles[j][i])
+    return out
+
+
+def _bounds(n_pixels, n_tiles):
+    """Tile edges along one axis, identical to those used in split_image."""
+    return np.array([i * n_pixels // n_tiles for i in range(n_tiles + 1)])
+
+
+def split_image(img, x, y):
+    """
+    Split an image (H, W, ...) into a grid of x sub-images across and y down.
+    Returns a nested list indexed [row][column].
+    """
+    img = np.asarray(img)
+    h, w = img.shape[:2]
+    if not (1 <= x <= w and 1 <= y <= h):
+        raise ValueError(f"x must be 1..{w} and y must be 1..{h}")
+
+    xs = _bounds(w, x)
+    ys = _bounds(h, y)
+
+    return [[img[ys[j]:ys[j + 1], xs[i]:xs[i + 1]] for i in range(x)]
+            for j in range(y)]
+
+
+def upscale_blocky(avgs, height, width, dtype=np.float32):
+    """
+    Expand a (y, x, 3) grid of tile colours to (height, width, 3),
+    filling each tile's area with its colour.
+    """
+    avgs = np.asarray(avgs, dtype=dtype)
+    y, x = avgs.shape[:2]
+    row_counts = np.diff(_bounds(height, y))   # pixel rows in each tile row
+    col_counts = np.diff(_bounds(width, x))    # pixel columns in each tile column
+    return np.repeat(np.repeat(avgs, row_counts, axis=0), col_counts, axis=1)
+
+
+def _interp_weights(n_pixels, n_tiles):
+    """For each pixel along an axis: the two neighbouring tile indices and the blend weight."""
+    edges = _bounds(n_pixels, n_tiles)
+    centres = (edges[:-1] + edges[1:]) / 2.0          # tile centres, in pixel units
+    px = np.arange(n_pixels) + 0.5                    # pixel centres
+    # Fractional tile index of each pixel (clamped to the first/last tile at the borders)
+    f = np.interp(px, centres, np.arange(n_tiles))
+    i0 = np.clip(np.floor(f).astype(int), 0, max(n_tiles - 2, 0))
+    i1 = np.minimum(i0 + 1, n_tiles - 1)
+    t = f - i0
+    return i0, i1, t
+
+
+def upscale_smooth(avgs, height, width, dtype=np.float32):
+    """
+    Expand a (y, x, 3) grid of tile colours to (height, width, 3) with
+    bilinear interpolation, treating each tile colour as the colour at
+    the centre of that tile. Pixels beyond the outermost tile centres
+    take the nearest tile's colour.
+    """
+    avgs = np.asarray(avgs, dtype=dtype)
+    y, x = avgs.shape[:2]
+
+    c0, c1, tx = _interp_weights(width, x)
+    r0, r1, ty = _interp_weights(height, y)
+    tx = tx.astype(dtype)[None, :, None]
+    ty = ty.astype(dtype)[:, None, None]
+
+    # Blend horizontally first: (y, width, 3)
+    horiz = avgs[:, c0, :] * (1 - tx) + avgs[:, c1, :] * tx
+    # Then vertically: (height, width, 3)
+    return horiz[r0] * (1 - ty) + horiz[r1] * ty
+
+
+def image_analysis_b1_b2_a(b1: image_data_colour, b2: image_data_colour, a: image_data_colour, op: analysis_options) -> dict:
     """Compare B1 with B2 and A using the already-aligned input images.
 
     The workflow:
@@ -174,18 +267,8 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
     # Output options
     results = dict()
 
-    results["Analysis Options"] = {
-        "rgb_comparison": op.rgb_comparison,
-        "lab_comparison": op.lab_comparison,
-        "use_masks": op.use_masks,
-        "intersection_mask": op.intersection_mask,
-        "images_aligned": op.images_aligned,
-        "mean_comparison": op.mean_comparison,
-        "per_pixel_comparison": op.per_pixel_comparison,
-        "heatmap_grid_size_x": op.heatmap_grid_size_x,
-        "heatmap_grid_size_y": op.heatmap_grid_size_y,
-        "dec_places": op.dec_places
-    }
+    if op.show_analysis_options:
+        results["Analysis Options"] = op.to_dict()
 
     if op.use_masks:
         # Get masks
@@ -262,78 +345,54 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
         "a": np.minimum(paper_mask["a"], ink_mask["a"])
     }
 
-    results["Image Data"] = {
-        "Before 1": {
-            "Image Array Shape": b1.get_pixels("rgb").shape,
-            "Resolution": str(b1.pixels.get("rgb").shape[0]) + "x" + str(b1.pixels.get("rgb").shape[1]),
-            "Total Pixels": str(np.prod(b1.pixels.get("rgb").shape[:2])),
-            "Paper Mask Array Shape": paper_mask["b1"].shape,
-            "Paper Pixels": str(np.sum(paper_mask["b1"])/3),
-            "Paper Percentage": str((np.sum(paper_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
-            "Ink Mask Array Shape": ink_mask["b1"].shape,
-            "Ink Pixels": str(np.sum(ink_mask["b1"])/3),
-            "Ink Percentage": str((np.sum(ink_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
-            "Unused Pixels": str(np.prod(b1.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b1"])/3),
-            "Unused Percentage": str((np.prod(b1.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
-            "Pixels in Both": str(np.sum(test_intersection_mask["b1"])/3),
-            "Pixels in Both Percentage": str((np.sum(test_intersection_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0)
-        },
-        "Before 2": {
-            "Image Array Shape": b2.get_pixels("rgb").shape,
-            "Resolution": str(b2.pixels.get("rgb").shape[0]) + "x" + str(b2.pixels.get("rgb").shape[1]),
-            "Total Pixels": str(np.prod(b2.pixels.get("rgb").shape[:2])),
-            "Paper Mask Array Shape": paper_mask["b2"].shape,
-            "Paper Pixels": str(np.sum(paper_mask["b2"])/3),
-            "Paper Percentage": str((np.sum(paper_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
-            "Ink Mask Array Shape": ink_mask["b2"].shape,
-            "Ink Pixels": str(np.sum(ink_mask["b2"])/3),
-            "Ink Percentage": str((np.sum(ink_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
-            "Unused Pixels": str(np.prod(b2.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b2"])/3),
-            "Unused Percentage": str((np.prod(b2.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
-            "Pixels in Both": str(np.sum(test_intersection_mask["b2"])/3),
-            "Pixels in Both Percentage": str((np.sum(test_intersection_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0)
-        },
-        "After": {
-            "Image Array Shape": a.get_pixels("rgb").shape,
-            "Resolution": str(a.pixels.get("rgb").shape[0]) + "x" + str(a.pixels.get("rgb").shape[1]),
-            "Total Pixels": str(np.prod(a.pixels.get("rgb").shape[:2])),
-            "Paper Mask Array Shape": paper_mask["a"].shape,
-            "Paper Pixels": str(np.sum(paper_mask["a"])/3),
-            "Paper Percentage": str((np.sum(paper_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
-            "Ink Mask Array Shape": ink_mask["a"].shape,
-            "Ink Pixels": str(np.sum(ink_mask["a"])/3),
-            "Ink Percentage": str((np.sum(ink_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
-            "Unused Pixels": str(np.prod(a.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["a"])/3),
-            "Unused Percentage": str((np.prod(a.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
-            "Pixels in Both": str(np.sum(test_intersection_mask["a"])/3),
-            "Pixels in Both Percentage": str((np.sum(test_intersection_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0)
+    if op.show_image_data:
+        results["Image Data"] = {
+            "Before 1": {
+                "Image Array Shape": b1.get_pixels("rgb").shape,
+                "Resolution": str(b1.pixels.get("rgb").shape[0]) + "x" + str(b1.pixels.get("rgb").shape[1]),
+                "Total Pixels": str(np.prod(b1.pixels.get("rgb").shape[:2])),
+                "Paper Mask Array Shape": paper_mask["b1"].shape,
+                "Paper Pixels": str(np.sum(paper_mask["b1"])/3),
+                "Paper Percentage": str((np.sum(paper_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
+                "Ink Mask Array Shape": ink_mask["b1"].shape,
+                "Ink Pixels": str(np.sum(ink_mask["b1"])/3),
+                "Ink Percentage": str((np.sum(ink_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
+                "Unused Pixels": str(np.prod(b1.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b1"])/3),
+                "Unused Percentage": str((np.prod(b1.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
+                "Pixels in Both": str(np.sum(test_intersection_mask["b1"])/3),
+                "Pixels in Both Percentage": str((np.sum(test_intersection_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0)
+            },
+            "Before 2": {
+                "Image Array Shape": b2.get_pixels("rgb").shape,
+                "Resolution": str(b2.pixels.get("rgb").shape[0]) + "x" + str(b2.pixels.get("rgb").shape[1]),
+                "Total Pixels": str(np.prod(b2.pixels.get("rgb").shape[:2])),
+                "Paper Mask Array Shape": paper_mask["b2"].shape,
+                "Paper Pixels": str(np.sum(paper_mask["b2"])/3),
+                "Paper Percentage": str((np.sum(paper_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
+                "Ink Mask Array Shape": ink_mask["b2"].shape,
+                "Ink Pixels": str(np.sum(ink_mask["b2"])/3),
+                "Ink Percentage": str((np.sum(ink_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
+                "Unused Pixels": str(np.prod(b2.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b2"])/3),
+                "Unused Percentage": str((np.prod(b2.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0),
+                "Pixels in Both": str(np.sum(test_intersection_mask["b2"])/3),
+                "Pixels in Both Percentage": str((np.sum(test_intersection_mask["b2"])/3)/np.prod(b2.pixels.get("rgb").shape[:2])*100.0)
+            },
+            "After": {
+                "Image Array Shape": a.get_pixels("rgb").shape,
+                "Resolution": str(a.pixels.get("rgb").shape[0]) + "x" + str(a.pixels.get("rgb").shape[1]),
+                "Total Pixels": str(np.prod(a.pixels.get("rgb").shape[:2])),
+                "Paper Mask Array Shape": paper_mask["a"].shape,
+                "Paper Pixels": str(np.sum(paper_mask["a"])/3),
+                "Paper Percentage": str((np.sum(paper_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
+                "Ink Mask Array Shape": ink_mask["a"].shape,
+                "Ink Pixels": str(np.sum(ink_mask["a"])/3),
+                "Ink Percentage": str((np.sum(ink_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
+                "Unused Pixels": str(np.prod(a.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["a"])/3),
+                "Unused Percentage": str((np.prod(a.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0),
+                "Pixels in Both": str(np.sum(test_intersection_mask["a"])/3),
+                "Pixels in Both Percentage": str((np.sum(test_intersection_mask["a"])/3)/np.prod(a.pixels.get("rgb").shape[:2])*100.0)
+            }
         }
-    }
-
-    """
-    #debug test save images
-    save_rgb_image(b1.get_pixels("rgb"), "debug", "b1")
-    save_rgb_image(b2.get_pixels("rgb"), "debug", "b2")
-    save_rgb_image(a.get_pixels("rgb"), "debug", "a")
-    save_rgb_image(paper_mask["b1"], "debug", "paper_mask_b1")
-    save_rgb_image(paper_mask["b2"], "debug", "paper_mask_b2")
-    save_rgb_image(paper_mask["a"], "debug", "paper_mask_a")
-    save_rgb_image(ink_mask["b1"], "debug", "ink_mask_b1")
-    save_rgb_image(ink_mask["b2"], "debug", "ink_mask_b2")
-    save_rgb_image(ink_mask["a"], "debug", "ink_mask_a")
-    """
-
-    mask_size_paper = {
-        "b1": np.sum(paper_mask["b1"])/3,
-        "b2": np.sum(paper_mask["b2"])/3,
-        "a": np.sum(paper_mask["a"])/3
-    }
-
-    mask_size_ink = {
-        "b1": np.sum(ink_mask["b1"])/3,
-        "b2": np.sum(ink_mask["b2"])/3,
-        "a": np.sum(ink_mask["a"])/3
-    }
 
     dec_place = op.dec_places
     
@@ -347,62 +406,21 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
         
         # mean comparison
         if op.mean_comparison:
-
-            rgb_paper_only = {
-                "b1": rgb["b1"]*paper_mask["b1"],
-                "b2": rgb["b2"]*paper_mask["b2"],
-                "a": rgb["a"]*paper_mask["a"]
-            }
-            
-            """
-            #debug mask apply check
-            save_rgb_image(rgb_paper_only["b1"], "debug", "paper_only_b1")
-            save_rgb_image(rgb_paper_only["b2"], "debug", "paper_only_b2")
-            save_rgb_image(rgb_paper_only["a"], "debug", "paper_only_a")
-            """
-
-            rgb_paper_only_flat = {
-                "b1": rgb_paper_only["b1"].reshape(-1, rgb_paper_only["b1"].shape[-1]),
-                "b2": rgb_paper_only["b2"].reshape(-1, rgb_paper_only["b2"].shape[-1]),
-                "a": rgb_paper_only["a"].reshape(-1, rgb_paper_only["a"].shape[-1])
-            }
-
             rgb_paper_avg = {
-                "b1": rgb_paper_only_flat["b1"].sum(axis=0, dtype=np.float64)/mask_size_paper["b1"],
-                "b2": rgb_paper_only_flat["b2"].sum(axis=0, dtype=np.float64)/mask_size_paper["b2"],
-                "a": rgb_paper_only_flat["a"].sum(axis=0, dtype=np.float64)/mask_size_paper["a"],
+                "b1": image_avg(rgb["b1"], paper_mask["b1"]),
+                "b2": image_avg(rgb["b2"], paper_mask["b2"]),
+                "a": image_avg(rgb["a"], paper_mask["a"])
             }
 
             rgb_paper_avg["b_avg"] = (rgb_paper_avg["b1"] + rgb_paper_avg["b2"]) / 2.0
             rgb_paper_avg["b_diff"] = np.abs(rgb_paper_avg["b1"] - rgb_paper_avg["b2"])
             rgb_paper_avg["diff"] = rgb_paper_avg["a"]-rgb_paper_avg["b_avg"]
 
-
-
             if op.use_masks:
-                rgb_ink_only = {
-                    "b1": rgb["b1"]*ink_mask["b1"],
-                    "b2": rgb["b2"]*ink_mask["b2"],
-                    "a": rgb["a"]*ink_mask["a"]
-                }
-
-                """
-                #debug mask apply check
-                save_rgb_image(rgb_ink_only["b1"], "debug", "ink_only_b1")
-                save_rgb_image(rgb_ink_only["b2"], "debug", "ink_only_b2")
-                save_rgb_image(rgb_ink_only["a"], "debug", "ink_only_a")
-                """
-
-                rgb_ink_only_flat = {
-                    "b1": rgb_ink_only["b1"].reshape(-1, rgb_ink_only["b1"].shape[-1]),
-                    "b2": rgb_ink_only["b2"].reshape(-1, rgb_ink_only["b2"].shape[-1]),
-                    "a": rgb_ink_only["a"].reshape(-1, rgb_ink_only["a"].shape[-1])
-                }
-
                 rgb_ink_avg = {
-                    "b1": rgb_ink_only_flat["b1"].sum(axis=0, dtype=np.float64)/mask_size_ink["b1"],
-                    "b2": rgb_ink_only_flat["b2"].sum(axis=0, dtype=np.float64)/mask_size_ink["b2"],
-                    "a": rgb_ink_only_flat["a"].sum(axis=0, dtype=np.float64)/mask_size_ink["a"],
+                    "b1": image_avg(rgb["b1"], ink_mask["b1"]),
+                    "b2": image_avg(rgb["b2"], ink_mask["b2"]),
+                    "a": image_avg(rgb["a"], ink_mask["a"])
                 }
 
                 rgb_ink_avg["b_avg"] = (rgb_ink_avg["b1"] + rgb_ink_avg["b2"]) / 2.0
@@ -519,6 +537,54 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
                 })
 
         # Per-pixel comparison (todo)
+        if op.per_pixel_comparison:
+            rgb_tile_images = {
+                "b1": split_image(rgb["b1"],op.heatmap_grid_size_x,op.heatmap_grid_size_y),
+                "b2": split_image(rgb["b2"],op.heatmap_grid_size_x,op.heatmap_grid_size_y),
+                "a": split_image(rgb["a"],op.heatmap_grid_size_x,op.heatmap_grid_size_y)
+            }
+
+            tile_mask_paper = {
+                "b1": split_image(paper_mask["b1"],op.heatmap_grid_size_x,op.heatmap_grid_size_y),
+                "b2": split_image(paper_mask["b2"],op.heatmap_grid_size_x,op.heatmap_grid_size_y),
+                "a": split_image(paper_mask["a"],op.heatmap_grid_size_x,op.heatmap_grid_size_y)
+            }
+
+            rgb_reduced_tile_images = dict()
+            for k in rgb_tile_images:
+                rgb_reduced_tile_images[k] = grid_averages(rgb_tile_images[k],tile_mask_paper[k])
+
+            # Compare each chunk before and after
+            rgb_reduced_tile_images["b_avg"] = (rgb_reduced_tile_images["b1"] + rgb_reduced_tile_images["b2"]) / 2.0
+            rgb_reduced_tile_images["diff"] = rgb_paper_avg["a"]-rgb_paper_avg["b_avg"]
+
+            # Process raw numbers into mean change and sd
+
+
+            # Add to results
+
+
+            # Make R, G and B change comparison heatmaps, recolour based on scale
+
+            # Make all heatmaps ready to show on UI
+            h = len(rgb["b1"])
+            w = len(rgb["b1"][0])
+
+            """
+            #debug test for saving heatmaps
+            for k in rgb_reduced_tile_images:
+                save_rgb_image(rgb_reduced_tile_images[k],"debug_heatmap",k)
+                
+                img = upscale_blocky(rgb_reduced_tile_images[k], h, w, dtype=np.float32)
+                save_rgb_image(img,"debug_heatmap",k+"_block")
+
+                img = upscale_smooth(rgb_reduced_tile_images[k], h, w, dtype=np.float32)
+                save_rgb_image(img,"debug_heatmap",k+"_smooth")
+            """
+
+            # Make UI for heatmaps and have button for save as png (same res as original) 
+
+
 
     # LAB comparisons
     if op.lab_comparison:
@@ -530,23 +596,10 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
         
         # mean comparison
         if op.mean_comparison:
-
-            lab_paper_only = {
-                "b1": lab["b1"]*paper_mask["b1"],
-                "b2": lab["b2"]*paper_mask["b2"],
-                "a": lab["a"]*paper_mask["a"]
-            }
-
-            lab_paper_only_flat = {
-                "b1": lab_paper_only["b1"].reshape(-1, lab_paper_only["b1"].shape[-1]),
-                "b2": lab_paper_only["b2"].reshape(-1, lab_paper_only["b2"].shape[-1]),
-                "a": lab_paper_only["a"].reshape(-1, lab_paper_only["a"].shape[-1])
-            }
-
             lab_paper_avg = {
-                "b1": lab_paper_only_flat["b1"].sum(axis=0, dtype=np.float64)/mask_size_paper["b1"],
-                "b2": lab_paper_only_flat["b2"].sum(axis=0, dtype=np.float64)/mask_size_paper["b2"],
-                "a": lab_paper_only_flat["a"].sum(axis=0, dtype=np.float64)/mask_size_paper["a"],
+                "b1": image_avg(lab["b1"], paper_mask["b1"]),
+                "b2": image_avg(lab["b2"], paper_mask["b2"]),
+                "a": image_avg(lab["a"], paper_mask["a"])
             }
 
             lab_paper_avg["b_avg"] = (lab_paper_avg["b1"] + lab_paper_avg["b2"]) / 2.0
@@ -554,22 +607,10 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
             lab_paper_avg["diff"] = lab_paper_avg["a"]-lab_paper_avg["b_avg"]
 
             if op.use_masks:
-                lab_ink_only = {
-                    "b1": lab["b1"]*ink_mask["b1"],
-                    "b2": lab["b2"]*ink_mask["b2"],
-                    "a": lab["a"]*ink_mask["a"]
-                }
-
-                lab_ink_only_flat = {
-                    "b1": lab_ink_only["b1"].reshape(-1, lab_ink_only["b1"].shape[-1]),
-                    "b2": lab_ink_only["b2"].reshape(-1, lab_ink_only["b2"].shape[-1]),
-                    "a": lab_ink_only["a"].reshape(-1, lab_ink_only["a"].shape[-1])
-                }
-
                 lab_ink_avg = {
-                    "b1": lab_ink_only_flat["b1"].sum(axis=0, dtype=np.float64)/mask_size_ink["b1"],
-                    "b2": lab_ink_only_flat["b2"].sum(axis=0, dtype=np.float64)/mask_size_ink["b2"],
-                    "a": lab_ink_only_flat["a"].sum(axis=0, dtype=np.float64)/mask_size_ink["a"],
+                    "b1": image_avg(lab["b1"], ink_mask["b1"]),
+                    "b2": image_avg(lab["b2"], ink_mask["b2"]),
+                    "a": image_avg(lab["a"], ink_mask["a"])
                 }
 
                 lab_ink_avg["b_avg"] = (lab_ink_avg["b1"] + lab_ink_avg["b2"]) / 2.0
@@ -709,5 +750,10 @@ def compare_images(b1: image_data_colour, b2: image_data_colour, a: image_data_c
                         }
                     }
                 })
+
+        # Per-pixel comparison (todo)
+        if op.per_pixel_comparison:
+            pass
+
 
     return results

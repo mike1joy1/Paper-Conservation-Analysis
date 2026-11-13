@@ -13,6 +13,9 @@ class analysis_options:
     """Container for all analysis option settings used by the UI."""
 
     def __init__(self):
+        self.show_analysis_options = False
+        self.show_image_data = False
+        
         self.rgb_comparison = True
         self.lab_comparison = True
         self.use_masks = True
@@ -27,8 +30,26 @@ class analysis_options:
         self.int_paper_mask = None
         self.int_ink_mask = None
 
+    def to_dict(self):
+        details = {
+            "show_analysis_options": self.show_analysis_options,
+            "show_image_data": self.show_image_data,
+            "rgb_comparison": self.rgb_comparison,
+            "lab_comparison": self.lab_comparison,
+            "use_masks": self.use_masks,
+            "intersection_mask": self.intersection_mask,
+            "images_aligned": self.images_aligned,
+            "mean_comparison": self.mean_comparison,
+            "per_pixel_comparison": self.per_pixel_comparison,
+            "heatmap_grid_size_x": self.heatmap_grid_size_x,
+            "heatmap_grid_size_y": self.heatmap_grid_size_y
+        }
+        return details
+
     def __str__(self) -> str:
         details = {
+            "show_analysis_options": self.show_analysis_options,
+            "show_image_data": self.show_image_data,
             "rgb_comparison": self.rgb_comparison,
             "lab_comparison": self.lab_comparison,
             "use_masks": self.use_masks,

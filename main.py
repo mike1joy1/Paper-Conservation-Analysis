@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
 from paperdiff.image_state import analysis_options, image_data_colour
 from paperdiff.loading import load_image
 from paperdiff.stats import verdict_for_region
-from paperdiff.workflow import describe_region_change, compare_images
+from paperdiff.workflow import describe_region_change, image_analysis_b1_b2_a
 
 
 class ZoomableLabel(QLabel):
@@ -533,6 +533,7 @@ class MainWindow(QMainWindow):
         self.image_type_group = QButtonGroup(page)
         self.colour_radio = QRadioButton("Colour images")
         self.normal_map_radio = QRadioButton("Normal maps")
+        self.normal_map_radio.setEnabled(False) # Grey out normal mode until feature is ready
         self.colour_radio.setChecked(True)
         self.image_type_group.addButton(self.colour_radio)
         self.image_type_group.addButton(self.normal_map_radio)
@@ -1257,6 +1258,20 @@ class MainWindow(QMainWindow):
         options_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         options_layout = QVBoxLayout(options_group)
 
+        self.show_anaysis_options_checkbox = QCheckBox("Show analysis options")
+        self.show_anaysis_options_checkbox.setChecked(self.analysis_options.show_analysis_options)
+        self.show_anaysis_options_checkbox.toggled.connect(
+            lambda checked: self.analysis_options.sync_from_ui(show_analysis_options=checked)
+        )
+        options_layout.addWidget(self.show_anaysis_options_checkbox)
+
+        self.show_image_data_checkbox = QCheckBox("Show image data")
+        self.show_image_data_checkbox.setChecked(self.analysis_options.show_image_data)
+        self.show_image_data_checkbox.toggled.connect(
+            lambda checked: self.analysis_options.sync_from_ui(show_image_data=checked)
+        )
+        options_layout.addWidget(self.show_image_data_checkbox)
+
         self.rgb_comparison_checkbox = QCheckBox("RGB comparison")
         self.rgb_comparison_checkbox.setChecked(self.analysis_options.rgb_comparison)
         self.rgb_comparison_checkbox.toggled.connect(
@@ -1405,7 +1420,7 @@ class MainWindow(QMainWindow):
                 self.analysis_options.int_paper_mask = paper_mask
                 self.analysis_options.int_ink_mask = ink_mask 
             
-            results = compare_images(self.images["B1"], self.images["B2"], self.images["A"], self.analysis_options)
+            results = image_analysis_b1_b2_a(self.images["B1"], self.images["B2"], self.images["A"], self.analysis_options)
             
             summary_lines = self.dict_to_string(results,indent=" "*4, section_break="\n"+("-" * 64)+"\n")
 

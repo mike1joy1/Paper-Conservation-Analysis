@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 
 from paperdiff.loading import load_image
-from paperdiff.workflow import describe_region_change, compare_images
+from paperdiff.workflow import describe_region_change, image_analysis_b1_b2_a
 
 
 def test_evaluate_reference_pair_reports_base_and_test_metrics():
@@ -12,7 +12,7 @@ def test_evaluate_reference_pair_reports_base_and_test_metrics():
     b2 = load_image(root / "test_images" / "B2.png")
     a = load_image(root / "test_images" / "A.png")
 
-    results = compare_images(b1, b2, a)
+    results = image_analysis_b1_b2_a(b1, b2, a)
 
     assert set(results) == {"base", "test"}
     assert results["base"]["score"] >= 0.0
@@ -29,7 +29,7 @@ def test_evaluate_reference_pair_accepts_already_aligned_images():
     b2 = load_image(root / "test_images" / "B2.png")
     a = load_image(root / "test_images" / "A.png")
 
-    results = compare_images(b1, b2, a)
+    results = image_analysis_b1_b2_a(b1, b2, a)
 
     assert results["base"]["reference"].shape == b1.shape
     assert results["test"]["reference"].shape == b1.shape
