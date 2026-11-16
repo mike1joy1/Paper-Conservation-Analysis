@@ -170,6 +170,34 @@ def image_avg(image, mask):
     else:
         return im.reshape(-1, im.shape[-1]).sum(axis=0, dtype=np.float64)/ms
 
+def image_avg_sd(image, mask):
+    """
+    Per-channel mean and standard deviation of `image`
+    over the unmasked pixels.
+    image : (H, W, C), e.g. an RGB/Lab image or the difference between two
+    mask  : (H, W, C), 0/1, all channels equal
+    Returns (avg, sd), each of shape (C,). Zeros if the mask is empty.
+    
+    For individual images:
+        avg is the average colour
+        SD is a measure of how uniform the image is (0 = completley uniform, e.g. smooth paper)
+    For a differenced image (A-B):
+        avg is the average colour change
+        SD is a measure of how uniformly the image has changed (0 = same change everywhere, e.g. treatment affect is same over whole paper)
+    """
+    n_ch = image.shape[-1]
+    ms = np.sum(mask) / n_ch                       # number of unmasked pixels
+
+    if ms == 0:
+        return np.zeros(n_ch), np.zeros(n_ch)
+
+    flat_im = image.reshape(-1, n_ch)
+    flat_m = np.asarray(mask).reshape(-1, n_ch)
+
+    avg = (flat_im * flat_m).sum(axis=0, dtype=np.float64) / ms
+    sq_dev = ((flat_im - avg) ** 2) * flat_m
+    sd = np.sqrt(sq_dev.sum(axis=0, dtype=np.float64) / ms)
+    return avg, sd
 
 def grid_averages(image_tiles, mask_tiles):
     """
@@ -252,6 +280,243 @@ def upscale_smooth(avgs, height, width, dtype=np.float32):
     horiz = avgs[:, c0, :] * (1 - tx) + avgs[:, c1, :] * tx
     # Then vertically: (height, width, 3)
     return horiz[r0] * (1 - ty) + horiz[r1] * ty
+
+def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks, scale=1.0, delta_e=False):
+
+    out_data = dict()
+    
+    b1p_avg, b1p_sd = image_avg_sd(b1,b1_pm)
+    b2p_avg, b2p_sd = image_avg_sd(b2,b2_pm)
+    ap_avg,  ap_sd  = image_avg_sd(a,a_pm)
+
+    if delta_e:
+        delta_e_paper_b1 = delta_e_dict(b1p_avg,ap_avg)
+        delta_e_paper_b2 = delta_e_dict(b2p_avg,ap_avg)
+        delta_e_paper_avg  = {k: (delta_e_paper_b1[k] + delta_e_paper_b2[k]) / 2.0 for k in delta_e_paper_b1}
+        delta_e_paper_diff = {k: abs(delta_e_paper_b1[k] - delta_e_paper_b2[k]) for k in delta_e_paper_b1}
+
+    b1p_avg *= scale
+    b2p_avg *= scale
+    ap_avg  *= scale
+    b1p_sd  *= scale
+    b2p_sd  *= scale
+    ap_sd   *= scale
+    
+    bp_avg, bp_sd = (b1p_avg+b2p_avg)/2.0, (b1p_sd+b2p_sd)/2.0
+    bp_avg_diff, bp_sd_diff = abs(b1p_avg-b2p_avg), abs(b1p_sd-b2p_sd)
+
+    comp_avg_p_1, comp_sd_p_1 = ap_avg - b1p_avg, ap_sd - b1p_sd
+    comp_avg_p_2, comp_sd_p_2 = ap_avg - b2p_avg, ap_sd - b2p_sd
+    comp_avg_p,   comp_sd_p   = ap_avg - bp_avg,  ap_sd - bp_sd
+
+    out_data["paper"] = {
+        "before": {
+            "avg": bp_avg,
+            "sd" : bp_sd
+        },
+        "after": {
+            "avg": ap_avg,
+            "sd" : ap_sd
+        },
+        "change": {
+            "avg": comp_avg_p,
+            "sd" : comp_sd_p
+        },
+        "plus_minus": {
+            "avg": bp_avg_diff,
+            "sd" : bp_sd_diff
+        }
+    }
+
+    if delta_e:
+        out_data["paper"].update({
+            "delta_e": {
+                "avg": delta_e_paper_avg,
+                "plus_minus": delta_e_paper_diff
+            }
+        })
+
+
+    if use_masks:
+        b1i_avg, b1i_sd = image_avg_sd(b1,b1_im)
+        b2i_avg, b2i_sd = image_avg_sd(b2,b2_im)
+        ai_avg,  ai_sd  = image_avg_sd(a,a_im)
+
+        if delta_e:
+            delta_e_ink_b1 = delta_e_dict(b1i_avg,ai_avg)
+            delta_e_ink_b2 = delta_e_dict(b2i_avg,ai_avg)
+            delta_e_ink_avg  = {k: (delta_e_ink_b1[k] + delta_e_ink_b2[k]) / 2.0 for k in delta_e_ink_b1}
+            delta_e_ink_diff = {k: abs(delta_e_ink_b1[k] - delta_e_ink_b2[k]) for k in delta_e_ink_b1}
+
+        b1i_avg *= scale
+        b2i_avg *= scale
+        ai_avg *= scale
+        b1i_sd *= scale
+        b2i_sd *= scale
+        ai_sd *= scale
+
+        
+        bi_avg, bi_sd = (b1i_avg+b2i_avg)/2.0, (b1i_sd+b2i_sd)/2.0
+        bi_avg_diff, bi_sd_diff = abs(b1i_avg-b2i_avg), abs(b1i_sd-b2i_sd)
+
+        comp_avg_i_1, comp_sd_i_1 = ai_avg - b1i_avg, ai_sd - b1i_sd
+        comp_avg_i_2, comp_sd_i_2 = ai_avg - b2i_avg, ai_sd - b2i_sd
+        comp_avg_i,   comp_sd_i   = ai_avg - bi_avg,  ai_sd - bi_sd
+
+        out_data["ink"] = {
+            "before": {
+                "avg": bi_avg,
+                "sd" : bi_sd
+            },
+            "after": {
+                "avg": ai_avg,
+                "sd" : ai_sd
+            },
+            "change": {
+                "avg": comp_avg_i,
+                "sd" : comp_sd_i
+            },
+            "plus_minus": {
+                "avg": bi_avg_diff/2.0,
+                "sd" : bi_sd_diff/2.0
+            }
+        }
+
+        if delta_e:
+            out_data["ink"].update({
+                "delta_e": {
+                    "avg": delta_e_ink_avg,
+                    "plus_minus": delta_e_ink_diff
+                }
+            })
+
+    return out_data
+
+
+def format_data_out(raw_data, paper_diff_text, ink_diff_text, c0, c1, c2, use_masks, dec_place, delta_e):
+
+    format_out = dict()
+
+    format_out = {
+        f"{"Paper" if use_masks else "Whole image"}": {
+            "Before": {
+                "Colour Average": {
+                    c0: f"{raw_data["paper"]["before"]["avg"][0]:{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["avg"][0]/2.0:.{dec_place}f})",
+                    c1: f"{raw_data["paper"]["before"]["avg"][1]:{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["avg"][1]/2.0:.{dec_place}f})",
+                    c2: f"{raw_data["paper"]["before"]["avg"][2]:{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["avg"][2]/2.0:.{dec_place}f})"
+                },
+                "Colour Standard Deviation": {
+                    c0: f"{raw_data["paper"]["before"]["sd"][0]:{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["sd"][0]/2.0:.{dec_place}f})",
+                    c1: f"{raw_data["paper"]["before"]["sd"][1]:{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["sd"][1]/2.0:.{dec_place}f})",
+                    c2: f"{raw_data["paper"]["before"]["sd"][2]:{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["sd"][2]/2.0:.{dec_place}f})"
+                }
+            },
+            "After": {
+                "Colour Average": {
+                    c0: f"{raw_data["paper"]["after"]["avg"][0]:{4+dec_place}.{dec_place}f}",
+                    c1: f"{raw_data["paper"]["after"]["avg"][1]:{4+dec_place}.{dec_place}f}",
+                    c2: f"{raw_data["paper"]["after"]["avg"][2]:{4+dec_place}.{dec_place}f}"
+                },
+                "Colour Standard Deviation": {
+                    c0: f"{raw_data["paper"]["after"]["sd"][0]:{4+dec_place}.{dec_place}f}",
+                    c1: f"{raw_data["paper"]["after"]["sd"][1]:{4+dec_place}.{dec_place}f}",
+                    c2: f"{raw_data["paper"]["after"]["sd"][2]:{4+dec_place}.{dec_place}f}"
+                }
+            },
+            "Change": {
+                "Colour Average": {
+                    c0: f"{raw_data["paper"]["change"]["avg"][0]:+{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["avg"][0]/2.0:.{dec_place}f})",
+                    c1: f"{raw_data["paper"]["change"]["avg"][1]:+{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["avg"][1]/2.0:.{dec_place}f})",
+                    c2: f"{raw_data["paper"]["change"]["avg"][2]:+{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["avg"][2]/2.0:.{dec_place}f})"
+                },
+                "Colour Standard Deviation": {
+                    c0: f"{raw_data["paper"]["change"]["sd"][0]:+{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["sd"][0]/2.0:.{dec_place}f})",
+                    c1: f"{raw_data["paper"]["change"]["sd"][1]:+{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["sd"][1]/2.0:.{dec_place}f})",
+                    c2: f"{raw_data["paper"]["change"]["sd"][2]:+{4+dec_place}.{dec_place}f}  (±{raw_data["paper"]["plus_minus"]["sd"][2]/2.0:.{dec_place}f})"
+                },
+                "Summary": {
+                    c0: paper_diff_text[0],
+                    c1: paper_diff_text[1],
+                    c2: paper_diff_text[2]
+                }
+            }
+        }
+    }
+
+    if delta_e:
+        format_out[f"{"Paper" if use_masks else "Whole image"}"]["Change"].update(
+            {
+                "Perceptual Colour Difference (ΔE)": {
+                    "ΔE76  ": f"{raw_data["paper"]["delta_e"]["avg"]["ΔE76"]:{3+dec_place}.{dec_place}f}  (±{raw_data["paper"]["delta_e"]["plus_minus"]["ΔE76"]/2.0:.{dec_place}f})",
+                    "ΔE94  ": f"{raw_data["paper"]["delta_e"]["avg"]["ΔE94"]:{3+dec_place}.{dec_place}f}  (±{raw_data["paper"]["delta_e"]["plus_minus"]["ΔE94"]/2.0:.{dec_place}f})",
+                    "ΔE2000": f"{raw_data["paper"]["delta_e"]["avg"]["ΔE2000"]:{3+dec_place}.{dec_place}f}  (±{raw_data["paper"]["delta_e"]["plus_minus"]["ΔE2000"]/2.0:.{dec_place}f})",
+                    "ΔE CMC": f"{raw_data["paper"]["delta_e"]["avg"]["ΔE CMC"]:{3+dec_place}.{dec_place}f}  (±{raw_data["paper"]["delta_e"]["plus_minus"]["ΔE CMC"]/2.0:.{dec_place}f})",
+                }
+            }
+        )
+
+
+    if use_masks:
+        format_out.update({
+            f"Ink": {
+                "Before": {
+                    "Colour Average": {
+                        c0: f"{raw_data["ink"]["before"]["avg"][0]:{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["avg"][0]/2.0:.{dec_place}f})",
+                        c1: f"{raw_data["ink"]["before"]["avg"][1]:{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["avg"][1]/2.0:.{dec_place}f})",
+                        c2: f"{raw_data["ink"]["before"]["avg"][2]:{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["avg"][2]/2.0:.{dec_place}f})"
+                    },
+                    "Colour Standard Deviation": {
+                        c0: f"{raw_data["ink"]["before"]["sd"][0]:{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["sd"][0]/2.0:.{dec_place}f})",
+                        c1: f"{raw_data["ink"]["before"]["sd"][1]:{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["sd"][1]/2.0:.{dec_place}f})",
+                        c2: f"{raw_data["ink"]["before"]["sd"][2]:{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["sd"][2]/2.0:.{dec_place}f})"
+                    }
+                },
+                "After": {
+                    "Colour Average": {
+                        c0: f"{raw_data["ink"]["after"]["avg"][0]:{4+dec_place}.{dec_place}f}",
+                        c1: f"{raw_data["ink"]["after"]["avg"][1]:{4+dec_place}.{dec_place}f}",
+                        c2: f"{raw_data["ink"]["after"]["avg"][2]:{4+dec_place}.{dec_place}f}"
+                    },
+                    "Colour Standard Deviation": {
+                        c0: f"{raw_data["ink"]["after"]["sd"][0]:{4+dec_place}.{dec_place}f}",
+                        c1: f"{raw_data["ink"]["after"]["sd"][1]:{4+dec_place}.{dec_place}f}",
+                        c2: f"{raw_data["ink"]["after"]["sd"][2]:{4+dec_place}.{dec_place}f}"
+                    }
+                },
+                "Change": {
+                    "Colour Average": {
+                        c0: f"{raw_data["ink"]["change"]["avg"][0]:+{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["avg"][0]/2.0:.{dec_place}f})",
+                        c1: f"{raw_data["ink"]["change"]["avg"][1]:+{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["avg"][1]/2.0:.{dec_place}f})",
+                        c2: f"{raw_data["ink"]["change"]["avg"][2]:+{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["avg"][2]/2.0:.{dec_place}f})"
+                    },
+                    "Colour Standard Deviation": {
+                        c0: f"{raw_data["ink"]["change"]["sd"][0]:+{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["sd"][0]/2.0:.{dec_place}f})",
+                        c1: f"{raw_data["ink"]["change"]["sd"][1]:+{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["sd"][1]/2.0:.{dec_place}f})",
+                        c2: f"{raw_data["ink"]["change"]["sd"][2]:+{4+dec_place}.{dec_place}f}  (±{raw_data["ink"]["plus_minus"]["sd"][2]/2.0:.{dec_place}f})"
+                    },
+                    "Summary": {
+                        c0: ink_diff_text[0],
+                        c1: ink_diff_text[1],
+                        c2: ink_diff_text[2]
+                    }
+                }
+            }
+        })
+
+        if delta_e:
+            format_out["Ink"]["Change"].update(
+                {
+                    "Perceptual Colour Difference (ΔE)": {
+                        "ΔE76  ": f"{raw_data["ink"]["delta_e"]["avg"]["ΔE76"]:{3+dec_place}.{dec_place}f}  (±{raw_data["ink"]["delta_e"]["plus_minus"]["ΔE76"]/2.0:.{dec_place}f})",
+                        "ΔE94  ": f"{raw_data["ink"]["delta_e"]["avg"]["ΔE94"]:{3+dec_place}.{dec_place}f}  (±{raw_data["ink"]["delta_e"]["plus_minus"]["ΔE94"]/2.0:.{dec_place}f})",
+                        "ΔE2000": f"{raw_data["ink"]["delta_e"]["avg"]["ΔE2000"]:{3+dec_place}.{dec_place}f}  (±{raw_data["ink"]["delta_e"]["plus_minus"]["ΔE2000"]/2.0:.{dec_place}f})",
+                        "ΔE CMC": f"{raw_data["ink"]["delta_e"]["avg"]["ΔE CMC"]:{3+dec_place}.{dec_place}f}  (±{raw_data["ink"]["delta_e"]["plus_minus"]["ΔE CMC"]/2.0:.{dec_place}f})",
+                    }
+                }
+            )
+
+    return format_out
+
 
 
 def image_analysis_b1_b2_a(b1: image_data_colour, b2: image_data_colour, a: image_data_colour, op: analysis_options) -> dict:
@@ -398,146 +663,31 @@ def image_analysis_b1_b2_a(b1: image_data_colour, b2: image_data_colour, a: imag
     
     # RGB comparisons
     if op.rgb_comparison:
+        rgb_scale = 100.0
         rgb = {
             "b1": b1.get_pixels("rgb"),
             "b2": b2.get_pixels("rgb"),
             "a": a.get_pixels("rgb")
         }
-        
+
         # mean comparison
+        rgb_mean_heading = "Overall change in RGB colour space"
+        results[rgb_mean_heading] = {"(Scale": f"{0.0:.{dec_place}f} to {rgb_scale:.{dec_place}f})"}
+
         if op.mean_comparison:
-            rgb_paper_avg = {
-                "b1": image_avg(rgb["b1"], paper_mask["b1"]),
-                "b2": image_avg(rgb["b2"], paper_mask["b2"]),
-                "a": image_avg(rgb["a"], paper_mask["a"])
-            }
-
-            rgb_paper_avg["b_avg"] = (rgb_paper_avg["b1"] + rgb_paper_avg["b2"]) / 2.0
-            rgb_paper_avg["b_diff"] = np.abs(rgb_paper_avg["b1"] - rgb_paper_avg["b2"])
-            rgb_paper_avg["diff"] = rgb_paper_avg["a"]-rgb_paper_avg["b_avg"]
-
+            raw_data_rgb = compare_b1_b2_a(rgb["b1"], rgb["b2"], rgb["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=rgb_scale, delta_e=False)
+            
+            rgb_paper_diff_text = describe_rgb_change(raw_data_rgb["paper"]["change"]["avg"]/rgb_scale)
             if op.use_masks:
-                rgb_ink_avg = {
-                    "b1": image_avg(rgb["b1"], ink_mask["b1"]),
-                    "b2": image_avg(rgb["b2"], ink_mask["b2"]),
-                    "a": image_avg(rgb["a"], ink_mask["a"])
-                }
+                rgb_ink_diff_text = describe_rgb_change(raw_data_rgb["ink"]["change"]["avg"]/rgb_scale)
+            else:
+                rgb_ink_diff_text = ["","",""]
 
-                rgb_ink_avg["b_avg"] = (rgb_ink_avg["b1"] + rgb_ink_avg["b2"]) / 2.0
-                rgb_ink_avg["b_diff"] = np.abs(rgb_ink_avg["b1"] - rgb_ink_avg["b2"])
-                rgb_ink_avg["diff"] = rgb_ink_avg["a"]-rgb_ink_avg["b_avg"]
-
-            rgb_raw_results = {
-                "b1": {
-                    "paper": {
-                        "r": rgb_paper_avg["b1"][0],
-                        "g": rgb_paper_avg["b1"][1],
-                        "b": rgb_paper_avg["b1"][2]
-                    }
-                },
-                "b2": {
-                    "paper": {
-                        "r": rgb_paper_avg["b2"][0],
-                        "g": rgb_paper_avg["b2"][1],
-                        "b": rgb_paper_avg["b2"][2]
-                    }
-                },
-                "a": {
-                    "paper": {
-                        "r": rgb_paper_avg["a"][0],
-                        "g": rgb_paper_avg["a"][1],
-                        "b": rgb_paper_avg["a"][2]
-                    }
-                }
-            }
-
-            if op.use_masks:
-                rgb_raw_results.update({
-                    "b1": {
-                        "ink": {
-                            "r": rgb_ink_avg["b1"][0],
-                            "g": rgb_ink_avg["b1"][1],
-                            "b": rgb_ink_avg["b1"][2]
-                        }
-                    },
-                    "b2": {
-                        "ink": {
-                            "r": rgb_ink_avg["b2"][0],
-                            "g": rgb_ink_avg["b2"][1],
-                            "b": rgb_ink_avg["b2"][2]
-                        }
-                    },
-                    "a": {
-                        "ink": {
-                            "r": rgb_ink_avg["a"][0],
-                            "g": rgb_ink_avg["a"][1],
-                            "b": rgb_ink_avg["a"][2]
-                        }
-                    }
-                })
-
-            rgb_scale = 100.0
-            for k in rgb_paper_avg: rgb_paper_avg[k] *= rgb_scale
-            if op.use_masks:
-                for k in rgb_ink_avg: rgb_ink_avg[k] *= rgb_scale
-
-            rgb_paper_avg["diff_text"] = describe_rgb_change(rgb_paper_avg["diff"]/rgb_scale)
-            if op.use_masks:
-                rgb_ink_avg["diff_text"] = describe_rgb_change(rgb_ink_avg["diff"]/rgb_scale)
-
-            results["Overall change in RGB colour space"] = {
-                "(Scale": f"{0.0:.{dec_place}f} to {rgb_scale:.{dec_place}f})",
-                f"{"Paper" if op.use_masks else "Whole image"}": {
-                    "Before": {
-                        "R": f"{rgb_paper_avg["b_avg"][0]:{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
-                        "G": f"{rgb_paper_avg["b_avg"][1]:{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
-                        "B": f"{rgb_paper_avg["b_avg"][2]:{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
-                    },
-                    "After": {
-                        "R": f"{rgb_paper_avg["a"][0]:{4+dec_place}.{dec_place}f}",
-                        "G": f"{rgb_paper_avg["a"][1]:{4+dec_place}.{dec_place}f}",
-                        "B": f"{rgb_paper_avg["a"][2]:{4+dec_place}.{dec_place}f}"
-                    },
-                    "Difference": {
-                        "R": f"{rgb_paper_avg["diff"][0]:+{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
-                        "G": f"{rgb_paper_avg["diff"][1]:+{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
-                        "B": f"{rgb_paper_avg["diff"][2]:+{4+dec_place}.{dec_place}f} ±{rgb_paper_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}",
-                    },
-                    "Summary": {
-                        "R": rgb_paper_avg["diff_text"][0],
-                        "G": rgb_paper_avg["diff_text"][1],
-                        "B": rgb_paper_avg["diff_text"][2]
-                    }
-                }
-            }
-            if op.use_masks:
-                results["Overall change in RGB colour space"].update({
-                    "Ink": {
-                        "Before": {
-                            "R": f"{rgb_ink_avg["b_avg"][0]:{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
-                            "G": f"{rgb_ink_avg["b_avg"][1]:{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
-                            "B": f"{rgb_ink_avg["b_avg"][2]:{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
-                        },
-                        "After": {
-                            "R": f"{rgb_ink_avg["a"][0]:{4+dec_place}.{dec_place}f}",
-                            "G": f"{rgb_ink_avg["a"][1]:{4+dec_place}.{dec_place}f}",
-                            "B": f"{rgb_ink_avg["a"][2]:{4+dec_place}.{dec_place}f}"
-                        },
-                        "Difference": {
-                            "R": f"{rgb_ink_avg["diff"][0]:+{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
-                            "G": f"{rgb_ink_avg["diff"][1]:+{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
-                            "B": f"{rgb_ink_avg["diff"][2]:+{4+dec_place}.{dec_place}f} ±{rgb_ink_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
-                        },
-                        "Summary": {
-                            "R": rgb_ink_avg["diff_text"][0],
-                            "G": rgb_ink_avg["diff_text"][1],
-                            "B": rgb_ink_avg["diff_text"][2]
-                        }
-                    }
-                })
+            results[rgb_mean_heading].update(format_data_out(raw_data_rgb,rgb_paper_diff_text,rgb_ink_diff_text,"R","G","B",op.use_masks,dec_place,False))
 
         # Per-pixel comparison (todo)
         if op.per_pixel_comparison:
+            """
             rgb_tile_images = {
                 "b1": split_image(rgb["b1"],op.heatmap_grid_size_x,op.heatmap_grid_size_y),
                 "b2": split_image(rgb["b2"],op.heatmap_grid_size_x,op.heatmap_grid_size_y),
@@ -556,7 +706,8 @@ def image_analysis_b1_b2_a(b1: image_data_colour, b2: image_data_colour, a: imag
 
             # Compare each chunk before and after
             rgb_reduced_tile_images["b_avg"] = (rgb_reduced_tile_images["b1"] + rgb_reduced_tile_images["b2"]) / 2.0
-            rgb_reduced_tile_images["diff"] = rgb_paper_avg["a"]-rgb_paper_avg["b_avg"]
+            rgb_reduced_tile_images["diff"] = rgb_reduced_tile_images["a"]-rgb_reduced_tile_images["b_avg"]
+            """
 
             # Process raw numbers into mean change and sd
 
@@ -588,168 +739,31 @@ def image_analysis_b1_b2_a(b1: image_data_colour, b2: image_data_colour, a: imag
 
     # LAB comparisons
     if op.lab_comparison:
+        lab_scale = 1.0
         lab = {
             "b1": b1.get_pixels("lab"),
             "b2": b2.get_pixels("lab"),
             "a": a.get_pixels("lab")
         }
-        
+
+        lab_mean_heading = "Overall change in CIELAB (L*a*b*) colour space"
+        results[lab_mean_heading] = {
+            "(L* Scale": f"{0.0:.{dec_place}f} to {lab_scale*100.0:.{dec_place}f})",
+            "(a*b* Scale": f"{-lab_scale*100.0:.{dec_place}f} to {lab_scale*100.0:.{dec_place}f})"
+        }
+
         # mean comparison
         if op.mean_comparison:
-            lab_paper_avg = {
-                "b1": image_avg(lab["b1"], paper_mask["b1"]),
-                "b2": image_avg(lab["b2"], paper_mask["b2"]),
-                "a": image_avg(lab["a"], paper_mask["a"])
-            }
-
-            lab_paper_avg["b_avg"] = (lab_paper_avg["b1"] + lab_paper_avg["b2"]) / 2.0
-            lab_paper_avg["b_diff"] = np.abs(lab_paper_avg["b1"] - lab_paper_avg["b2"])
-            lab_paper_avg["diff"] = lab_paper_avg["a"]-lab_paper_avg["b_avg"]
-
+            raw_data_lab = compare_b1_b2_a(lab["b1"], lab["b2"], lab["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=lab_scale, delta_e=True)
+            
+            lab_paper_diff_text = describe_lab_change(raw_data_lab["paper"]["change"]["avg"]/lab_scale)
             if op.use_masks:
-                lab_ink_avg = {
-                    "b1": image_avg(lab["b1"], ink_mask["b1"]),
-                    "b2": image_avg(lab["b2"], ink_mask["b2"]),
-                    "a": image_avg(lab["a"], ink_mask["a"])
-                }
+                lab_ink_diff_text = describe_lab_change(raw_data_lab["ink"]["change"]["avg"]/lab_scale)
+            else:
+                lab_ink_diff_text = ["","",""]
 
-                lab_ink_avg["b_avg"] = (lab_ink_avg["b1"] + lab_ink_avg["b2"]) / 2.0
-                lab_ink_avg["b_diff"] = np.abs(lab_ink_avg["b1"] - lab_ink_avg["b2"])
-                lab_ink_avg["diff"] = lab_ink_avg["a"]-lab_ink_avg["b_avg"]
+            results[lab_mean_heading].update(format_data_out(raw_data_lab,lab_paper_diff_text,lab_ink_diff_text,"L*","a*","b*",op.use_masks,dec_place, True))
 
-            lab_raw_results = {
-                "b1": {
-                    "paper": {
-                        "l": lab_paper_avg["b1"][0],
-                        "a": lab_paper_avg["b1"][1],
-                        "b": lab_paper_avg["b1"][2]
-                    }
-                },
-                "b2": {
-                    "paper": {
-                        "l": lab_paper_avg["b2"][0],
-                        "a": lab_paper_avg["b2"][1],
-                        "b": lab_paper_avg["b2"][2]
-                    }
-                },
-                "a": {
-                    "paper": {
-                        "l": lab_paper_avg["a"][0],
-                        "a": lab_paper_avg["a"][1],
-                        "b": lab_paper_avg["a"][2]
-                    }
-                }
-            }
-
-            if op.use_masks:
-                lab_raw_results.update({
-                    "b1": {
-                        "ink": {
-                            "l": lab_ink_avg["b1"][0],
-                            "a": lab_ink_avg["b1"][1],
-                            "b": lab_ink_avg["b1"][2]
-                        }
-                    },
-                    "b2": {
-                        "ink": {
-                            "l": lab_ink_avg["b2"][0],
-                            "a": lab_ink_avg["b2"][1],
-                            "b": lab_ink_avg["b2"][2]
-                        }
-                    },
-                    "a": {
-                        "ink": {
-                            "l": lab_ink_avg["a"][0],
-                            "a": lab_ink_avg["a"][1],
-                            "b": lab_ink_avg["a"][2]
-                        }
-                    }
-                })
-
-            delta_e_paper_b1 = delta_e_dict(lab_paper_avg["b1"],lab_paper_avg["a"])
-            delta_e_paper_b2 = delta_e_dict(lab_paper_avg["b2"],lab_paper_avg["a"])
-            delta_e_paper_avg  = {k: (delta_e_paper_b1[k] + delta_e_paper_b2[k]) / 2.0 for k in delta_e_paper_b1}
-            delta_e_paper_diff = {k: abs(delta_e_paper_b1[k] - delta_e_paper_b2[k]) for k in delta_e_paper_b1}
-
-            if op.use_masks:
-                delta_e_ink_b1 = delta_e_dict(lab_ink_avg["b1"],lab_ink_avg["a"])
-                delta_e_ink_b2 = delta_e_dict(lab_ink_avg["b2"],lab_ink_avg["a"])
-                delta_e_ink_avg  = {k: (delta_e_ink_b1[k] + delta_e_ink_b2[k]) / 2.0 for k in delta_e_ink_b1}
-                delta_e_ink_diff = {k: abs(delta_e_ink_b1[k] - delta_e_ink_b2[k]) for k in delta_e_ink_b1}
-
-            lab_scale = 100.0
-            for k in lab_paper_avg: lab_paper_avg[k] *= lab_scale/100.0
-            if op.use_masks:
-                for k in lab_ink_avg: lab_ink_avg[k] *= lab_scale/100.0
-
-            lab_paper_avg["diff_text"] = describe_lab_change(lab_paper_avg["diff"]*100/lab_scale)
-            if op.use_masks:
-                lab_ink_avg["diff_text"] = describe_lab_change(lab_ink_avg["diff"]*100/lab_scale)
-
-            results["Overall change in CIELAB (L*a*b*) colour space"] = {
-                "(L* Scale": f"{0.0:.{dec_place}f} to {lab_scale:.{dec_place}f})",
-                "(a*b* Scale": f"{-lab_scale:.{dec_place}f} to {lab_scale:.{dec_place}f})",
-                f"{"Paper" if op.use_masks else "Whole image"}": {
-                    "Before": {
-                        "L*": f"{lab_paper_avg["b_avg"][0]:{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
-                        "a*": f"{lab_paper_avg["b_avg"][1]:{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
-                        "b*": f"{lab_paper_avg["b_avg"][2]:{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
-                    },
-                    "After": {
-                        "L*": f"{lab_paper_avg["a"][0]:{4+dec_place}.{dec_place}f}",
-                        "a*": f"{lab_paper_avg["a"][1]:{4+dec_place}.{dec_place}f}",
-                        "b*": f"{lab_paper_avg["a"][2]:{4+dec_place}.{dec_place}f}"
-                    },
-                    "Difference": {
-                        "L*": f"{lab_paper_avg["a"][0]-lab_paper_avg["b_avg"][0]:+{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
-                        "a*": f"{lab_paper_avg["a"][1]-lab_paper_avg["b_avg"][1]:+{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
-                        "b*": f"{lab_paper_avg["a"][2]-lab_paper_avg["b_avg"][2]:+{4+dec_place}.{dec_place}f} ±{lab_paper_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
-                    },
-                    "Summary": {
-                        "L*": lab_paper_avg["diff_text"][0],
-                        "a*": lab_paper_avg["diff_text"][1],
-                        "b*": lab_paper_avg["diff_text"][2]
-                    },
-                    "Perceptual Colour Difference (ΔE)": {
-                        "ΔE76  ": f"{delta_e_paper_avg["ΔE76"]:{3+dec_place}.{dec_place}f} ±{delta_e_paper_diff["ΔE76"]/2.0:{4+dec_place}.{dec_place}f}",
-                        "ΔE94  ": f"{delta_e_paper_avg["ΔE94"]:{3+dec_place}.{dec_place}f} ±{delta_e_paper_diff["ΔE94"]/2.0:{4+dec_place}.{dec_place}f}",
-                        "ΔE2000": f"{delta_e_paper_avg["ΔE2000"]:{3+dec_place}.{dec_place}f} ±{delta_e_paper_diff["ΔE2000"]/2.0:{4+dec_place}.{dec_place}f}",
-                        "ΔE CMC": f"{delta_e_paper_avg["ΔE CMC"]:{3+dec_place}.{dec_place}f} ±{delta_e_paper_diff["ΔE CMC"]/2.0:{4+dec_place}.{dec_place}f}"
-                    }
-                }
-            }
-
-            if op.use_masks:
-                results["Overall change in CIELAB (L*a*b*) colour space"].update({
-                    "Ink": {
-                        "Before": {
-                            "L*": f"{lab_ink_avg["b_avg"][0]:{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
-                            "a*": f"{lab_ink_avg["b_avg"][1]:{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
-                            "b*": f"{lab_ink_avg["b_avg"][2]:{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
-                        },
-                        "After": {
-                            "L*": f"{lab_ink_avg["a"][0]:{4+dec_place}.{dec_place}f}",
-                            "a*": f"{lab_ink_avg["a"][1]:{4+dec_place}.{dec_place}f}",
-                            "b*": f"{lab_ink_avg["a"][2]:{4+dec_place}.{dec_place}f}"
-                        },
-                        "Difference": {
-                            "L*": f"{lab_ink_avg["a"][0]-lab_ink_avg["b_avg"][0]:+{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][0]/2.0:{4+dec_place}.{dec_place}f}",
-                            "a*": f"{lab_ink_avg["a"][1]-lab_ink_avg["b_avg"][1]:+{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][1]/2.0:{4+dec_place}.{dec_place}f}",
-                            "b*": f"{lab_ink_avg["a"][2]-lab_ink_avg["b_avg"][2]:+{4+dec_place}.{dec_place}f} ±{lab_ink_avg["b_diff"][2]/2.0:{4+dec_place}.{dec_place}f}"
-                        },
-                        "Summary": {
-                            "L*": lab_ink_avg["diff_text"][0],
-                            "a*": lab_ink_avg["diff_text"][1],
-                            "b*": lab_ink_avg["diff_text"][2]
-                        },
-                        "Perceptual Colour Difference (ΔE)": {
-                            "ΔE76  ": f"{delta_e_ink_avg["ΔE76"]:{3+dec_place}.{dec_place}f} ±{delta_e_ink_diff["ΔE76"]/2.0:{4+dec_place}.{dec_place}f}",
-                            "ΔE94  ": f"{delta_e_ink_avg["ΔE94"]:{3+dec_place}.{dec_place}f} ±{delta_e_ink_diff["ΔE94"]/2.0:{4+dec_place}.{dec_place}f}",
-                            "ΔE2000": f"{delta_e_ink_avg["ΔE2000"]:{3+dec_place}.{dec_place}f} ±{delta_e_ink_diff["ΔE2000"]/2.0:{4+dec_place}.{dec_place}f}",
-                            "ΔE CMC": f"{delta_e_ink_avg["ΔE CMC"]:{3+dec_place}.{dec_place}f} ±{delta_e_ink_diff["ΔE CMC"]/2.0:{4+dec_place}.{dec_place}f}"
-                        }
-                    }
-                })
 
         # Per-pixel comparison (todo)
         if op.per_pixel_comparison:
