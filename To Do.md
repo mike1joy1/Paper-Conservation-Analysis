@@ -2,15 +2,15 @@ TO DO
 
 Data
 - Add delta E for sRGB (Simple Euclidean and redmean)
-- SD / roughness measure for different scales (using convolutions / blur)
+- Roughness measure for different scales (using convolutions / blur at different scales and taking the SD)
+
+Normals
+- Normals/depthmap mode plan
 
 UI
 - Loading bar and separate thread
 - Export results (csv?)
 - Import / Export masks as images
-
-Normals
-- Normals/depthmap mode plan
 
 Batch
 - Batch mode plan - folder structure for holistic cross compare or only file name match
