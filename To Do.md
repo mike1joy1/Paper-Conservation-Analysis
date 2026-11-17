@@ -1,15 +1,12 @@
 TO DO
 
-Now
-- Compare chunks
-- Make heatmaps and save as png
-- Copy to LAB
-- Display heatmaps in results?
-- Export results (csv?)
-- Import / Export masks as images
+Data
+- SD / roughness measure for different scales (using convolutions / blur)
 
 UI
 - Loading bar and separate thread
+- Export results (csv?)
+- Import / Export masks as images
 
 Normals
 - Normals/depthmap mode plan
