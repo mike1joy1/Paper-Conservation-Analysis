@@ -1,6 +1,7 @@
 TO DO
 
 Data
+- Add delta E for sRGB (Simple Euclidean and redmean)
 - SD / roughness measure for different scales (using convolutions / blur)
 
 UI
