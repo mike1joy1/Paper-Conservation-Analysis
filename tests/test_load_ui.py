@@ -4,9 +4,10 @@ import time
 import numpy as np
 import pytest
 from PIL import Image
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtGui import QHelpEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox, QPushButton
+from PySide6.QtWidgets import QApplication, QCheckBox, QFileDialog, QMessageBox, QPushButton, QRadioButton, QSlider, QToolTip
 
 import main
 import paperdiff.image_state as image_state
@@ -46,6 +47,123 @@ def wait_until(predicate):
     while not predicate() and time.monotonic() < deadline:
         QTest.qWait(10)
     assert predicate(), "Timed out waiting for operation"
+
+
+def test_all_app_controls_have_tooltips(window):
+    controls = []
+    for tab in (window.load_tab, window.mask_tab, window.check_alignment_tab, window.analysis_options_tab):
+        for control_type in (QPushButton, QCheckBox, QRadioButton, QSlider):
+            controls.extend(tab.findChildren(control_type))
+    missing = [control.text() if hasattr(control, "text") else type(control).__name__
+               for control in controls if not control.toolTip().strip()]
+    assert not missing, f"Controls without tooltips: {missing}"
+    assert "not yet available" in window.per_pixel_comparison_checkbox.toolTip()
+    assert "not yet available" in window.heatmap_grid_slider_x.toolTip()
+    assert "not yet available" in window.heatmap_grid_slider_y.toolTip()
+
+
+def test_tab_tooltips_are_shown_even_when_tabs_are_disabled(window):
+    window.show()
+    tab_bar = window.tab_widget.tabBar()
+    for index in range(window.tab_widget.count()):
+        tooltip = window.tab_widget.tabToolTip(index)
+        assert tooltip.strip()
+        pos = tab_bar.tabRect(index).center()
+        event = QHelpEvent(QEvent.ToolTip, pos, tab_bar.mapToGlobal(pos))
+        QApplication.sendEvent(tab_bar, event)
+        assert QToolTip.text() == tooltip
+    QToolTip.hideText()
+
+
+def test_tooltip_reasons_follow_loading_and_mask_settings(window, monkeypatch, image_paths):
+    mask_index = window.tab_widget.indexOf(window.mask_tab)
+    results_index = window.tab_widget.indexOf(window.results_tab)
+    assert window.tab_widget.tabToolTip(mask_index).endswith("(images must be loaded first)")
+    assert window.tab_widget.tabToolTip(results_index).endswith("(images must be loaded first)")
+    assert window.load_images_button.toolTip().endswith("(select all three images first)")
+    assert window.normal_map_radio.toolTip().endswith("(normal map analysis is not yet available)")
+    window.show()
+    button = window.load_images_button
+    pos = button.rect().center()
+    QApplication.sendEvent(button, QHelpEvent(QEvent.ToolTip, pos, button.mapToGlobal(pos)))
+    assert QToolTip.text() == button.toolTip()
+    QToolTip.hideText()
+
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    assert window.load_images_button.toolTip() == window._base_control_tooltips[window.load_images_button]
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+
+    assert window.tab_widget.tabToolTip(mask_index) == window._base_tab_tooltips[window.mask_tab]
+    assert window.tab_widget.tabToolTip(results_index).endswith("(analysis must be completed first)")
+    assert window.mask_threshold_slider.toolTip().endswith("(enable Use mask on the Mask tab first)")
+    assert window.use_masks_checkbox.toolTip().endswith("(enable Use mask on the Mask tab first)")
+    window.use_mask_checkbox.setChecked(True)
+    assert window.mask_threshold_slider.toolTip() == window._base_control_tooltips[window.mask_threshold_slider]
+    assert window.reference_weight_slider.toolTip().endswith("(select Reference colour mask generation)")
+    assert window.intersection_mask_checkbox.toolTip().endswith("(enable Use masks and Aligned image mode first)")
+
+    window.colour_radio.setChecked(True)
+    assert window.mask_threshold_slider.toolTip().endswith("(select Luminance mask generation)")
+    assert window.reference_weight_slider.toolTip() == window._base_control_tooltips[window.reference_weight_slider]
+    window.use_masks_checkbox.setChecked(True)
+    assert window.intersection_mask_checkbox.toolTip().endswith("(enable Aligned image mode first)")
+    assert window.per_pixel_comparison_checkbox.toolTip().endswith(
+        "(enable Intersection mask or turn off Use masks)"
+    )
+    window.alignment_checkbox.setChecked(True)
+    assert window.intersection_mask_checkbox.toolTip() == window._base_control_tooltips[window.intersection_mask_checkbox]
+    window.intersection_mask_checkbox.setChecked(True)
+    assert window.heatmap_grid_slider_x.toolTip().endswith("(enable Per-pixel comparison first)")
+    window.per_pixel_comparison_checkbox.setChecked(True)
+    assert window.heatmap_grid_slider_x.toolTip() == window._base_control_tooltips[window.heatmap_grid_slider_x]
+
+    window.use_mask_checkbox.setChecked(False)
+    assert window.use_masks_checkbox.toolTip().endswith("(enable Use mask on the Mask tab first)")
+    for widget in window._base_control_tooltips:
+        if not widget.isEnabled():
+            assert not widget.toolTip().endswith("(unavailable)"), widget.toolTip()
+
+
+def test_tooltip_reasons_follow_analysis_cancellation_and_success(window, monkeypatch, image_paths):
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    window.tab_widget.setCurrentWidget(window.analysis_options_tab)
+    started = threading.Event()
+    release = threading.Event()
+
+    def paused_analysis(*args, **kwargs):
+        started.set()
+        if not release.wait(5):
+            raise RuntimeError("Timed out waiting for test")
+        return {"Result": "complete"}
+
+    monkeypatch.setattr(main, "image_analysis_b1_b2_a", paused_analysis)
+    window.analyze_button.click()
+    try:
+        wait_until(started.is_set)
+        load_index = window.tab_widget.indexOf(window.load_tab)
+        assert window.tab_widget.tabToolTip(load_index).endswith("(analysis is in progress)")
+        assert window.analyze_button.toolTip().endswith("(analysis is in progress)")
+        assert window.rgb_comparison_checkbox.toolTip().endswith("(analysis is in progress)")
+        window.cancel_analysis_button.click()
+        assert window.cancel_analysis_button.toolTip().endswith("(cancellation is in progress)")
+    finally:
+        release.set()
+        wait_until(lambda: window._analysis_thread is None)
+    results_index = window.tab_widget.indexOf(window.results_tab)
+    assert window.tab_widget.tabToolTip(results_index).endswith("(analysis must be completed first)")
+    assert window.analyze_button.toolTip() == window._base_control_tooltips[window.analyze_button]
+
+    window.analyze_button.click()
+    wait_until(lambda: window._analysis_thread is None)
+    assert window.tab_widget.tabToolTip(results_index) == window._base_tab_tooltips[window.results_tab]
+    window.tab_widget.setCurrentWidget(window.load_tab)
+    select_image(window, monkeypatch, "B1", image_paths["B1"])
+    assert window.tab_widget.tabToolTip(results_index).endswith("(images must be loaded first)")
 
 
 def test_select_previews_then_loads_all_images(window, monkeypatch, image_paths, tmp_path):
@@ -124,6 +242,7 @@ def test_select_previews_then_loads_all_images(window, monkeypatch, image_paths,
     assert not window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.image_results_tab))
     assert not window.alignment_checkbox.isEnabled()
     assert not window.alignment_checkbox.isChecked()
+    assert window.alignment_checkbox.toolTip().endswith("(images must have the same resolution)")
 
 
 def test_failed_load_keeps_previous_set_and_blocks_downstream(window, monkeypatch, image_paths):
@@ -187,12 +306,17 @@ def test_loading_progress_and_responsive_ui(window, monkeypatch, image_paths):
             assert window.load_progress_bar.value() == (task - 1) * 100 // 3
             assert window.cancel_load_button.isVisible()
             assert not window.load_images_button.isEnabled()
+            assert window.load_images_button.toolTip().endswith("(image loading is in progress)")
+            assert window.tab_widget.tabToolTip(window.tab_widget.indexOf(window.mask_tab)).endswith(
+                "(image loading is in progress)"
+            )
             assert all(not button.isEnabled() for button in window.load_select_buttons.values())
             assert not window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.analysis_options_tab))
             if task == 1:
                 responded = []
                 QTimer.singleShot(0, lambda: responded.append(True))
                 wait_until(lambda: bool(responded))
+                wait_until(lambda: bool(calls))
                 assert calls[0] != threading.get_ident()
             permits.release()
         wait_until(lambda: window._loading_thread is None)
@@ -241,6 +365,7 @@ def test_cancel_loading_preserves_previous_data_and_tab_states(window, monkeypat
         assert all(not window.tab_widget.isTabEnabled(i) for i in range(1, window.tab_widget.count()))
         window.cancel_load_button.click()
         assert not window.cancel_load_button.isEnabled()
+        assert window.cancel_load_button.toolTip().endswith("(cancellation is in progress)")
         assert window.load_status_label.text() == "Cancelling image loading..."
     finally:
         release.set()
@@ -432,6 +557,8 @@ def test_analysis_runs_off_ui_thread_and_keeps_inputs_stable(window, monkeypatch
     window.images["B1"].set_mask("paper", np.array([[True, True, False, True]] * 3))
     window.images["B2"].set_mask("paper", np.array([[True, False, True, True]] * 3))
     window.images["A"].set_mask("paper", np.array([[True, True, True, False]] * 3))
+    window.use_mask_checkbox.setChecked(True)
+    window.use_masks_checkbox.setChecked(True)
     window.alignment_checkbox.setChecked(True)
     window.intersection_mask_checkbox.setChecked(True)
     started = threading.Event()
@@ -457,6 +584,10 @@ def test_analysis_runs_off_ui_thread_and_keeps_inputs_stable(window, monkeypatch
         wait_until(lambda: window.analysis_progress_label.text().startswith("Task 2/4"))
         assert window.analysis_progress_bar.value() == 25
         assert not window.analyze_button.isEnabled()
+        assert window.analyze_button.toolTip().endswith("(analysis is in progress)")
+        assert window.tab_widget.tabToolTip(window.tab_widget.indexOf(window.load_tab)).endswith(
+            "(analysis is in progress)"
+        )
         assert not window.analysis_settings_group.isEnabled()
         assert not window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.load_tab))
         assert not window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.mask_tab))
@@ -562,6 +693,7 @@ def test_cancel_analysis_stops_worker_and_preserves_results(window, monkeypatch,
         window.cancel_analysis_button.click()
         assert window.analysis_progress_label.text() == "Cancelling analysis..."
         assert not window.cancel_analysis_button.isEnabled()
+        assert window.cancel_analysis_button.toolTip().endswith("(cancellation is in progress)")
         assert not window.analyze_button.isEnabled()
         assert not window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.load_tab))
     finally:
@@ -624,6 +756,8 @@ def test_cancel_during_intersection_mask_calculation(window, monkeypatch, image_
     window.load_images_button.click()
     wait_until(lambda: window._loading_thread is None)
     window.tab_widget.setCurrentWidget(window.analysis_options_tab)
+    window.use_mask_checkbox.setChecked(True)
+    window.use_masks_checkbox.setChecked(True)
     window.alignment_checkbox.setChecked(True)
     window.intersection_mask_checkbox.setChecked(True)
     started = threading.Event()
@@ -716,6 +850,8 @@ def test_analysis_reports_each_real_stage_and_completed_percentage(window, monke
     window.load_images_button.click()
     wait_until(lambda: window._loading_thread is None)
     window.tab_widget.setCurrentWidget(window.analysis_options_tab)
+    window.use_mask_checkbox.setChecked(True)
+    window.use_masks_checkbox.setChecked(True)
     window.alignment_checkbox.setChecked(True)
     window.intersection_mask_checkbox.setChecked(True)
 

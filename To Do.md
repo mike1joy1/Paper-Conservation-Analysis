@@ -10,7 +10,6 @@ Normals
 - Normals/depthmap mode plan
 
 UI
-- Loading bar and separate thread
 - Export results (csv?)
 - Import / Export masks as images
 

@@ -441,10 +441,94 @@ class MainWindow(QMainWindow):
         self.tab_widget.addTab(self.results_tab, "5) Results data")
         self.tab_widget.addTab(self.image_results_tab, "6) Image results")
 
+        self._base_tab_tooltips = dict((
+            (self.load_tab, "Select, preview, and load the before and after images."),
+            (self.mask_tab, "Generate paper and ink masks."),
+            (self.check_alignment_tab, "Inspect image alignment."),
+            (self.analysis_options_tab, "Configure and run analysis."),
+            (self.results_tab, "View the data report."),
+            (self.image_results_tab, "Image results are reserved for a future feature."),
+        ))
+        for tab, tooltip in self._base_tab_tooltips.items():
+            self.tab_widget.setTabToolTip(self.tab_widget.indexOf(tab), tooltip)
+
         for index in range(1, self.tab_widget.count()):
             self.tab_widget.setTabEnabled(index, False)
 
+        self._base_control_tooltips = {
+            widget: widget.toolTip()
+            for tab in self._base_tab_tooltips
+            for widget in tab.findChildren(QWidget)
+            if widget.toolTip()
+        }
+        self._refresh_disabled_tooltips()
         self._refresh_preview_box_sizes()
+
+    def _disabled_tab_reason(self, tab):
+        if self._loading_thread is not None:
+            return "image loading is in progress"
+        if self._analysis_thread is not None:
+            return "analysis is in progress"
+        if tab in (self.results_tab, self.image_results_tab) and self.tab_widget.isTabEnabled(
+            self.tab_widget.indexOf(self.mask_tab)
+        ):
+            return "analysis must be completed first"
+        return "images must be loaded first"
+
+    def _disabled_control_reason(self, widget):
+        if widget is self.normal_map_radio:
+            return "normal map analysis is not yet available"
+        if widget is self.cancel_load_button or widget is self.cancel_analysis_button:
+            return "cancellation is in progress"
+        if self._loading_thread is not None:
+            return "image loading is in progress"
+        if self._analysis_thread is not None:
+            return "analysis is in progress"
+
+        for tab in self._base_tab_tooltips:
+            if tab.isAncestorOf(widget) and not self.tab_widget.isTabEnabled(self.tab_widget.indexOf(tab)):
+                return self._disabled_tab_reason(tab)
+
+        if widget is self.load_images_button:
+            return "select all three images first"
+        if widget is self.alignment_checkbox:
+            return "images must have the same resolution"
+        if (self.mask_tab.isAncestorOf(widget) or widget is self.use_masks_checkbox) and not self.use_mask_checkbox.isChecked():
+            return "enable Use mask on the Mask tab first"
+        if widget is self.mask_threshold_slider:
+            return "select Luminance mask generation"
+        if widget in (
+            self.reference_weight_slider,
+            self.change_all_paper_button,
+            self.change_all_ink_button,
+            *self.paper_colour_buttons.values(),
+            *self.ink_colour_buttons.values(),
+        ):
+            return "select Reference colour mask generation"
+        if widget is self.intersection_mask_checkbox:
+            if not self.analysis_options.use_masks and not self.analysis_options.images_aligned:
+                return "enable Use masks and Aligned image mode first"
+            if not self.analysis_options.use_masks:
+                return "enable Use masks in Analysis first"
+            return "enable Aligned image mode first"
+        if widget is self.per_pixel_comparison_checkbox:
+            return "enable Intersection mask or turn off Use masks"
+        if widget in (self.heatmap_grid_slider_x, self.heatmap_grid_slider_y):
+            return "enable Per-pixel comparison first"
+        return "unavailable"
+
+    def _refresh_disabled_tooltips(self):
+        if not hasattr(self, "_base_control_tooltips"):
+            return
+        for tab, tooltip in self._base_tab_tooltips.items():
+            index = self.tab_widget.indexOf(tab)
+            if not self.tab_widget.isTabEnabled(index):
+                tooltip = f"{tooltip} ({self._disabled_tab_reason(tab)})"
+            self.tab_widget.setTabToolTip(index, tooltip)
+        for widget, tooltip in self._base_control_tooltips.items():
+            if not widget.isEnabled():
+                tooltip = f"{tooltip} ({self._disabled_control_reason(widget)})"
+            widget.setToolTip(tooltip)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -672,6 +756,7 @@ class MainWindow(QMainWindow):
         self.analysis_progress_label.setText("Load the selected images before analysis.")
         for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab, self.results_tab, self.image_results_tab):
             self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
+        self._refresh_disabled_tooltips()
 
     def _load_selected_images(self):
         """Start loading the selected set without blocking the UI."""
@@ -702,6 +787,7 @@ class MainWindow(QMainWindow):
         self._loading_thread.progress.connect(self._load_progress)
         self._loading_thread.finished.connect(self._load_finished)
         self._loading_thread.start()
+        self._refresh_disabled_tooltips()
 
     def cancel_loading(self):
         if self._loading_thread is None:
@@ -710,6 +796,7 @@ class MainWindow(QMainWindow):
         self.cancel_load_button.setEnabled(False)
         self.cancel_load_button.setText("Cancelling...")
         self.load_status_label.setText("Cancelling image loading...")
+        self._refresh_disabled_tooltips()
 
     @Slot(int, int, str)
     def _load_progress(self, current, total, key):
@@ -762,6 +849,7 @@ class MainWindow(QMainWindow):
             for tab in (self.results_tab, self.image_results_tab):
                 self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
         finally:
+            self._refresh_disabled_tooltips()
             thread.deleteLater()
             if self._close_after_loading:
                 self.close()
@@ -780,7 +868,9 @@ class MainWindow(QMainWindow):
         input_layout = QHBoxLayout(input_group)
         self.image_type_group = QButtonGroup(page)
         self.colour_radio = QRadioButton("Colour images")
+        self.colour_radio.setToolTip("Use colour photographs for the comparison.")
         self.normal_map_radio = QRadioButton("Normal maps")
+        self.normal_map_radio.setToolTip("Normal map analysis is not yet available.")
         self.normal_map_radio.setEnabled(False) # Grey out normal mode until feature is ready
         self.colour_radio.setChecked(True)
         self.image_type_group.addButton(self.colour_radio)
@@ -813,6 +903,7 @@ class MainWindow(QMainWindow):
             card_layout.addWidget(preview_label)
 
             button = QPushButton(f"Select {self.image_key_labels[key]}")
+            button.setToolTip(f"Select and preview {self.image_key_labels[key]}; load the selected images afterwards.")
             button.clicked.connect(lambda checked, value=key: self._open_image_for_key(value))
             button.setFixedHeight(30)
             card_layout.addWidget(button)
@@ -838,9 +929,11 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(grid)
         self.load_images_button = QPushButton("Load images")
+        self.load_images_button.setToolTip("Load and prepare all three selected images for analysis.")
         self.load_images_button.setEnabled(False)
         self.load_images_button.clicked.connect(self._load_selected_images)
         self.cancel_load_button = QPushButton("Cancel loading")
+        self.cancel_load_button.setToolTip("Cancel loading between processing steps and keep the previously loaded data.")
         self.cancel_load_button.setStyleSheet(CANCEL_BUTTON_STYLE)
         self.cancel_load_button.clicked.connect(self.cancel_loading)
         self.cancel_load_button.hide()
@@ -975,6 +1068,10 @@ class MainWindow(QMainWindow):
         layout.setAlignment(Qt.AlignTop)
 
         self.alignment_checkbox = QCheckBox("Aligned image mode")
+        self.alignment_checkbox.setToolTip(
+            "Treat the images as already aligned and preview their shared mask areas. "
+            "All three images must have the same resolution."
+        )
         self.alignment_checkbox.setChecked(False)
         self.alignment_checkbox.setEnabled(False)
         self.analysis_options.images_aligned = self.alignment_checkbox.isChecked()
@@ -992,9 +1089,13 @@ class MainWindow(QMainWindow):
         view_layout = QHBoxLayout(view_group)
         self.alignment_mode_group = QButtonGroup(page)
         self.original_radio = QRadioButton("Original")
+        self.original_radio.setToolTip("Show the selected image without a mask overlay.")
         self.mask_radio = QRadioButton("Mask")
+        self.mask_radio.setToolTip("When masks are enabled, show paper in white, ink in black, and excluded pixels in red.")
         self.masked_paper_radio = QRadioButton("Paper mask")
+        self.masked_paper_radio.setToolTip("When masks are enabled, colour pixels outside the paper mask.")
         self.masked_ink_radio = QRadioButton("Ink mask")
+        self.masked_ink_radio.setToolTip("When masks are enabled, colour pixels outside the ink mask.")
         self.original_radio.setChecked(True)
         self.alignment_mode_group.addButton(self.original_radio)
         self.alignment_mode_group.addButton(self.mask_radio)
@@ -1009,6 +1110,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(view_group)
 
         self.overlay_button = QPushButton(f"Mask overlay colour: {self.mask_overlay_colour.name()}")
+        self.overlay_button.setToolTip("Choose the colour used for pixels outside the selected mask.")
         self.overlay_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.overlay_button.clicked.connect(self._choose_mask_overlay_colour)
         self._update_overlay_button_style()
@@ -1024,6 +1126,7 @@ class MainWindow(QMainWindow):
         self.alignment_buttons = {}
         for key in ["B1", "B2", "A"]:
             button = QPushButton(key)
+            button.setToolTip(f"Show {self.image_key_labels[key]} in the alignment preview.")
             button.setCheckable(True)
             button.clicked.connect(lambda checked, value=key: self._set_alignment_view(value))
             button_row.addWidget(button)
@@ -1037,6 +1140,7 @@ class MainWindow(QMainWindow):
         self.alignment_preview.clicked.connect(self._cycle_alignment_image)
 
         self.reset_alignment_zoom_button = QPushButton("Reset zoom")
+        self.reset_alignment_zoom_button.setToolTip("Fit the alignment image to the preview and reset its position.")
         self.reset_alignment_zoom_button.clicked.connect(self._reset_alignment_zoom)
 
         selector_row = QHBoxLayout()
@@ -1111,6 +1215,7 @@ class MainWindow(QMainWindow):
             self.colour_radio.setEnabled(use_mask_enabled)
         if hasattr(self, "alignment_preview"):
             self._display_alignment_image()
+        self._refresh_disabled_tooltips()
 
     def _set_mask_reference_colour(self, key: str, region: str):
         image_data = self.images[key]
@@ -1264,6 +1369,7 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "alignment_preview"):
             self._display_alignment_image()
+        self._refresh_disabled_tooltips()
 
     def _create_mask_tab(self):
         """Tab 3: prepare and preview masks used for the paper and ink analysis."""
@@ -1273,6 +1379,7 @@ class MainWindow(QMainWindow):
         layout.setAlignment(Qt.AlignTop)
 
         self.use_mask_checkbox = QCheckBox("Use mask")
+        self.use_mask_checkbox.setToolTip("Enable mask generation and allow masks to be used in the analysis.")
         self.use_mask_checkbox.setChecked(False)
         self.use_mask_checkbox.toggled.connect(lambda checked: self._set_mask_controls_enabled(checked))
         layout.addWidget(self.use_mask_checkbox)
@@ -1289,7 +1396,9 @@ class MainWindow(QMainWindow):
         mode_layout = QHBoxLayout(mode_group)
         self.mask_mode_group = QButtonGroup(page)
         self.luminance_radio = QRadioButton("Luminance")
+        self.luminance_radio.setToolTip("Separate ink and paper using an image brightness threshold.")
         self.colour_radio = QRadioButton("Reference colour")
+        self.colour_radio.setToolTip("Separate ink and paper using their selected reference colours.")
         self.luminance_radio.setChecked(True)
         self.mask_mode_group.addButton(self.luminance_radio)
         self.mask_mode_group.addButton(self.colour_radio)
@@ -1300,6 +1409,9 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(mode_group)
 
         self.mask_threshold_slider = QSlider(Qt.Horizontal)
+        self.mask_threshold_slider.setToolTip(
+            "Set the brightness threshold for ink: pixels at or below it are classified as ink."
+        )
         self.mask_threshold_slider.setRange(0, 255)
         self.mask_threshold_slider.setValue(80)
         self.mask_threshold_slider.setFixedHeight(18)
@@ -1312,6 +1424,9 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.mask_threshold_slider)
 
         self.reference_weight_slider = QSlider(Qt.Horizontal)
+        self.reference_weight_slider.setToolTip(
+            "Adjust the balance between paper and ink reference colours; higher values favour paper."
+        )
         self.reference_weight_slider.setRange(0, 100)
         self.reference_weight_slider.setValue(50)
         self.reference_weight_slider.setEnabled(False)
@@ -1324,6 +1439,7 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.reference_weight_slider)
 
         self.mask_border_slider = QSlider(Qt.Horizontal)
+        self.mask_border_slider.setToolTip("Set how many pixels to exclude from mask boundaries.")
         self.mask_border_slider.setRange(0, 20)
         self.mask_border_slider.setValue(4)
         self.mask_border_slider.setFixedHeight(18)
@@ -1364,9 +1480,11 @@ class MainWindow(QMainWindow):
 
             colour_row = QHBoxLayout()
             paper_button = QPushButton("Paper colour")
+            paper_button.setToolTip(f"Choose the paper reference colour for {self.image_key_labels[key]}.")
             paper_button.setMinimumWidth(90)
             paper_button.clicked.connect(lambda checked, value=key: self._set_mask_reference_colour(value, "paper"))
             ink_button = QPushButton("Ink colour")
+            ink_button.setToolTip(f"Choose the ink reference colour for {self.image_key_labels[key]}.")
             ink_button.setMinimumWidth(90)
             ink_button.clicked.connect(lambda checked, value=key: self._set_mask_reference_colour(value, "ink"))
             colour_row.addWidget(paper_button)
@@ -1374,11 +1492,13 @@ class MainWindow(QMainWindow):
             card_layout.addLayout(colour_row)
 
             button = QPushButton(f"Generate mask for {key}")
+            button.setToolTip(f"Generate paper and ink masks for {self.image_key_labels[key]} using the current settings.")
             button.setMinimumWidth(120)
             button.clicked.connect(lambda checked, value=key: self._generate_mask_for_key(value))
             card_layout.addWidget(button)
 
             remove_button = QPushButton(f"Remove mask for {key}")
+            remove_button.setToolTip(f"Remove the generated masks for {self.image_key_labels[key]}.")
             remove_button.setMinimumWidth(120)
             remove_button.clicked.connect(lambda checked, value=key: self._remove_mask_for_key(value))
             card_layout.addWidget(remove_button)
@@ -1392,15 +1512,18 @@ class MainWindow(QMainWindow):
             grid.addWidget(card, 0, col)
 
         self.change_all_paper_button = QPushButton("Set all paper colours")
+        self.change_all_paper_button.setToolTip("Set the same paper reference colour for all three images.")
         self.change_all_paper_button.setMinimumWidth(180)
         self.change_all_paper_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.change_all_paper_button.clicked.connect(lambda: self._change_all_reference_colours("paper"))
         self.change_all_ink_button = QPushButton("Set all ink colours")
+        self.change_all_ink_button.setToolTip("Set the same ink reference colour for all three images.")
         self.change_all_ink_button.setMinimumWidth(180)
         self.change_all_ink_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.change_all_ink_button.clicked.connect(lambda: self._change_all_reference_colours("ink"))
 
         self.generate_all_masks_button = QPushButton("Generate masks for all")
+        self.generate_all_masks_button.setToolTip("Generate paper and ink masks for all three loaded images.")
         self.generate_all_masks_button.setMinimumWidth(180)
         self.generate_all_masks_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.generate_all_masks_button.clicked.connect(self._generate_mask_for_all)
@@ -1488,6 +1611,7 @@ class MainWindow(QMainWindow):
                 self.heatmap_grid_slider_y.setEnabled(False)
             else:
                 self.heatmap_grid_slider_y.setEnabled(True)
+        self._refresh_disabled_tooltips()
 
     def _create_analysis_options_tab(self):
         """Tab 4: configure and run the analysis."""
@@ -1501,6 +1625,7 @@ class MainWindow(QMainWindow):
         options_layout = QVBoxLayout(self.analysis_settings_group)
 
         self.show_anaysis_options_checkbox = QCheckBox("Show analysis options")
+        self.show_anaysis_options_checkbox.setToolTip("Include the selected analysis settings in the results report.")
         self.show_anaysis_options_checkbox.setChecked(self.analysis_options.show_analysis_options)
         self.show_anaysis_options_checkbox.toggled.connect(
             lambda checked: self.analysis_options.sync_from_ui(show_analysis_options=checked)
@@ -1508,6 +1633,7 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.show_anaysis_options_checkbox)
 
         self.show_image_data_checkbox = QCheckBox("Show image data")
+        self.show_image_data_checkbox.setToolTip("Include image dimensions and mask pixel counts in the results report.")
         self.show_image_data_checkbox.setChecked(self.analysis_options.show_image_data)
         self.show_image_data_checkbox.toggled.connect(
             lambda checked: self.analysis_options.sync_from_ui(show_image_data=checked)
@@ -1515,6 +1641,7 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.show_image_data_checkbox)
 
         self.rgb_comparison_checkbox = QCheckBox("RGB comparison")
+        self.rgb_comparison_checkbox.setToolTip("Include RGB colour comparisons in the results.")
         self.rgb_comparison_checkbox.setChecked(self.analysis_options.rgb_comparison)
         self.rgb_comparison_checkbox.toggled.connect(
             lambda checked: self.analysis_options.sync_from_ui(rgb_comparison=checked)
@@ -1522,6 +1649,7 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.rgb_comparison_checkbox)
 
         self.lab_comparison_checkbox = QCheckBox("LAB comparison")
+        self.lab_comparison_checkbox.setToolTip("Include CIELAB colour comparisons in the results.")
         self.lab_comparison_checkbox.setChecked(self.analysis_options.lab_comparison)
         self.lab_comparison_checkbox.toggled.connect(
             lambda checked: self.analysis_options.sync_from_ui(lab_comparison=checked)
@@ -1529,6 +1657,9 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.lab_comparison_checkbox)
 
         self.use_masks_checkbox = QCheckBox("Use masks")
+        self.use_masks_checkbox.setToolTip(
+            "Compare paper and ink separately using their masks. Enable Use mask on the Mask tab first."
+        )
         self.use_masks_checkbox.setChecked(self.analysis_options.use_masks)
         self.use_masks_checkbox.toggled.connect(
             lambda checked: (
@@ -1539,6 +1670,9 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.use_masks_checkbox)
 
         self.intersection_mask_checkbox = QCheckBox("Intersection mask")
+        self.intersection_mask_checkbox.setToolTip(
+            "Compare only pixels included in the corresponding mask in all three aligned images."
+        )
         self.intersection_mask_checkbox.setChecked(self.analysis_options.intersection_mask)
         self.intersection_mask_checkbox.toggled.connect(
             lambda checked: (
@@ -1549,6 +1683,7 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.intersection_mask_checkbox)
 
         self.mean_comparison_checkbox = QCheckBox("Mean comparison")
+        self.mean_comparison_checkbox.setToolTip("Compare average colours and report their differences.")
         self.mean_comparison_checkbox.setChecked(self.analysis_options.mean_comparison)
         self.mean_comparison_checkbox.toggled.connect(
             lambda checked: self.analysis_options.sync_from_ui(mean_comparison=checked)
@@ -1556,6 +1691,7 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.mean_comparison_checkbox)
 
         self.per_pixel_comparison_checkbox = QCheckBox("Per-pixel comparison")
+        self.per_pixel_comparison_checkbox.setToolTip("Per-pixel comparison and heatmaps are not yet available.")
         self.per_pixel_comparison_checkbox.setChecked(self.analysis_options.per_pixel_comparison)
         self.per_pixel_comparison_checkbox.toggled.connect(
             lambda checked: (
@@ -1566,6 +1702,9 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.per_pixel_comparison_checkbox)
 
         self.heatmap_grid_slider_x = QSlider(Qt.Horizontal)
+        self.heatmap_grid_slider_x.setToolTip(
+            "Set the planned number of heatmap divisions across the image. Heatmaps are not yet available."
+        )
         self.heatmap_grid_slider_x.setRange(2, 1000)
         self.heatmap_grid_slider_x.setValue(self.analysis_options.heatmap_grid_size_x)
         self.heatmap_grid_slider_x.valueChanged.connect(
@@ -1580,6 +1719,9 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(self.heatmap_grid_slider_x)
 
         self.heatmap_grid_slider_y = QSlider(Qt.Horizontal)
+        self.heatmap_grid_slider_y.setToolTip(
+            "Set the planned number of heatmap divisions down the image. Heatmaps are not yet available."
+        )
         self.heatmap_grid_slider_y.setRange(2, 1000)
         self.heatmap_grid_slider_y.setValue(self.analysis_options.heatmap_grid_size_y)
         self.heatmap_grid_slider_y.valueChanged.connect(
@@ -1595,9 +1737,13 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.analysis_settings_group)
         self.analyze_button = QPushButton("Analyse")
+        self.analyze_button.setToolTip("Run the selected analysis on the loaded images.")
         self.analyze_button.setFixedWidth(170)
         self.analyze_button.clicked.connect(self.analyze_images)
         self.cancel_analysis_button = QPushButton("Cancel analysis")
+        self.cancel_analysis_button.setToolTip(
+            "Cancel analysis between calculation steps and keep the previous report."
+        )
         self.cancel_analysis_button.setStyleSheet(CANCEL_BUTTON_STYLE)
         self.cancel_analysis_button.clicked.connect(self.cancel_analysis)
         self.cancel_analysis_button.hide()
@@ -1693,6 +1839,7 @@ class MainWindow(QMainWindow):
         self._analysis_thread.progress.connect(self._analysis_progress)
         self._analysis_thread.finished.connect(self._analysis_finished)
         self._analysis_thread.start()
+        self._refresh_disabled_tooltips()
 
     def cancel_analysis(self):
         if self._analysis_thread is None:
@@ -1701,6 +1848,7 @@ class MainWindow(QMainWindow):
         self.cancel_analysis_button.setEnabled(False)
         self.cancel_analysis_button.setText("Cancelling...")
         self.analysis_progress_label.setText("Cancelling analysis...")
+        self._refresh_disabled_tooltips()
 
     @Slot(int, int, str)
     def _analysis_progress(self, task, total, description):
@@ -1739,6 +1887,7 @@ class MainWindow(QMainWindow):
             self.analysis_progress_label.setText(f"Analysis failed. {self.analysis_progress_label.text()}")
             QMessageBox.critical(self, "Analysis failed", f"Unable to analyze the images:\n{exc}")
         finally:
+            self._refresh_disabled_tooltips()
             thread.deleteLater()
             if self._close_after_analysis:
                 self.close()
