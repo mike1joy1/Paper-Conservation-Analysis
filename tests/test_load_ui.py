@@ -1,5 +1,6 @@
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -164,6 +165,272 @@ def test_tooltip_reasons_follow_analysis_cancellation_and_success(window, monkey
     window.tab_widget.setCurrentWidget(window.load_tab)
     select_image(window, monkeypatch, "B1", image_paths["B1"])
     assert window.tab_widget.tabToolTip(results_index).endswith("(images must be loaded first)")
+
+
+def test_export_without_generated_mask_is_solid_grey(window, monkeypatch, image_paths):
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    assert not window.mask_export_buttons["B1"].isEnabled()
+    window.use_mask_checkbox.setChecked(True)
+    assert window.mask_export_buttons["B1"].isEnabled()
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: None)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    path = Path(window.mask_export_paths["B1"])
+
+    window.mask_export_buttons["B1"].click()
+    with Image.open(path) as output:
+        pixels = np.asarray(output.convert("RGB"))
+    assert pixels.shape == (3, 4, 3)
+    assert np.all(pixels == 128)
+    assert not any(window.images["B1"].masks_exists.values())
+
+    window.mask_generate_buttons["B1"].click()
+    window.mask_remove_buttons["B1"].click()
+    window.mask_export_buttons["B1"].click()
+    with Image.open(path) as output:
+        assert np.all(np.asarray(output.convert("RGB")) == 128)
+
+    window.images["B1"].set_mask("paper", np.zeros((3, 4), dtype=bool))
+    window.mask_export_buttons["B1"].click()
+    with Image.open(path) as output:
+        assert np.all(np.asarray(output.convert("RGB")) == 0)
+
+
+def test_export_mask_requires_a_loaded_image(tmp_path):
+    with pytest.raises(ValueError, match="Load an image"):
+        image_data_colour("B1").export_mask(str(tmp_path / "mask.png"))
+
+
+def test_import_export_masks_round_trip_and_overwrite(window, monkeypatch, image_paths, tmp_path):
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    window.use_mask_checkbox.setChecked(True)
+    default_path = Path(image_paths["B1"]).with_name("B1_mask.png")
+    assert window.mask_export_paths["B1"] == str(default_path)
+    assert window.mask_export_path_fields["B1"].text() == str(default_path)
+    assert window.mask_export_buttons["B1"].isEnabled()
+
+    colours = np.array([
+        [[255, 255, 255], [0, 0, 0], [128, 128, 128], [255, 0, 0]],
+        [[254, 255, 255], [127, 127, 127], [0, 0, 1], [1, 128, 128]],
+        [[255, 255, 255], [0, 0, 0], [128, 128, 128], [7, 42, 91]],
+    ], dtype=np.uint8)
+    input_path = tmp_path / "input-mask.png"
+    Image.fromarray(colours).save(input_path)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(input_path), ""))
+    window.mask_import_buttons["B1"].click()
+    image = window.images["B1"]
+    paper = np.all(colours == (255, 255, 255), axis=-1) | np.all(colours == (128, 128, 128), axis=-1)
+    ink = np.all(colours == (0, 0, 0), axis=-1) | np.all(colours == (128, 128, 128), axis=-1)
+    assert np.array_equal(image.masks["paper"][..., 0], paper)
+    assert np.array_equal(image.masks["ink"][..., 0], ink)
+    assert np.array_equal(image.mask_border[..., 0], ~paper & ~ink)
+    assert all(image.masks_exists.values())
+    assert window.mask_export_buttons["B1"].isEnabled()
+    assert not window.mask_preview_labels["B1"].pixmap().isNull()
+
+    window._set_alignment_mode("mask")
+    preview = window.alignment_preview._base_pixmap.toImage()
+    assert [preview.pixelColor(x, 0).getRgb()[:3] for x in range(4)] == [tuple(c) for c in colours[0]]
+
+    messages = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: messages.append(args))
+    window.mask_export_buttons["B1"].click()
+    assert default_path.exists()
+    expected = colours.copy()
+    expected[~paper & ~ink] = (255, 0, 0)
+    assert np.array_equal(np.asarray(Image.open(default_path).convert("RGB")), expected)
+    assert messages
+
+    image.set_mask("paper", np.ones((3, 4), dtype=bool))
+    image.set_mask("ink", np.zeros((3, 4), dtype=bool))
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.No)
+    window.mask_export_buttons["B1"].click()
+    assert np.array_equal(np.asarray(Image.open(default_path).convert("RGB")), expected)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    window.mask_export_buttons["B1"].click()
+    assert np.all(np.asarray(Image.open(default_path).convert("RGB")) == 255)
+    window.mask_remove_buttons["B1"].click()
+    assert window.mask_export_buttons["B1"].isEnabled()
+
+
+def test_mask_import_failure_preserves_existing_masks(window, monkeypatch, image_paths, tmp_path):
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    window.use_mask_checkbox.setChecked(True)
+    window.mask_generate_buttons["B1"].click()
+    image = window.images["B1"]
+    previous_masks = image.masks
+    previous_border = image.mask_border
+    errors = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args))
+
+    mismatch = tmp_path / "wrong-size.png"
+    Image.new("RGB", (5, 3), "white").save(mismatch)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(mismatch), ""))
+    window.mask_import_buttons["B1"].click()
+    assert "5 x 3" in errors[-1][2] and "4 x 3" in errors[-1][2]
+    assert image.masks is previous_masks
+    assert image.mask_border is previous_border
+    assert all(image.masks_exists.values())
+
+    invalid = tmp_path / "invalid-mask.png"
+    invalid.write_text("not an image")
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(invalid), ""))
+    window.mask_import_buttons["B1"].click()
+    assert len(errors) == 2
+    assert image.masks is previous_masks
+    assert window.mask_export_buttons["B1"].isEnabled()
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args, **kwargs: ("", ""))
+    window.mask_import_buttons["B1"].click()
+    assert len(errors) == 2 and image.masks is previous_masks
+
+    def fail_save(*args, **kwargs):
+        raise OSError("test write error")
+
+    monkeypatch.setattr(Image.Image, "save", fail_save)
+    window.mask_export_buttons["B1"].click()
+    assert "test write error" in errors[-1][2]
+    assert image.masks is previous_masks
+
+
+def test_mask_export_path_selection_and_reload(window, monkeypatch, image_paths, tmp_path):
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    window.use_mask_checkbox.setChecked(True)
+    default = window.mask_export_paths["B1"]
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: ("", ""))
+    window.mask_export_path_buttons["B1"].click()
+    assert window.mask_export_paths["B1"] == default
+
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(tmp_path / "mask.jpg"), ""))
+    window.mask_export_path_buttons["B1"].click()
+    assert warnings and window.mask_export_paths["B1"] == default
+    custom = tmp_path / "custom-mask"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(custom), ""))
+    window.mask_export_path_buttons["B1"].click()
+    assert window.mask_export_paths["B1"] == str(custom) + ".png"
+    assert window.mask_export_path_fields["B1"].text() == str(custom) + ".png"
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: None)
+    window.mask_generate_buttons["B1"].click()
+    window.mask_export_buttons["B1"].click()
+    assert Path(str(custom) + ".png").is_file()
+
+    replacement = tmp_path / "replacement.jpg"
+    Image.new("RGB", (4, 3), "red").save(replacement)
+    select_image(window, monkeypatch, "A", str(replacement))
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    assert window.mask_export_paths["B1"] == str(custom) + ".png"
+    assert window.mask_export_paths["A"] == str(tmp_path / "replacement_mask.png")
+    assert window.mask_export_buttons["B1"].isEnabled()
+
+
+def test_export_all_masks_uses_paths_and_respects_overwrite(window, monkeypatch, image_paths, tmp_path):
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    assert not window.export_all_masks_button.isEnabled()
+    assert not window.auto_import_masks_button.isEnabled()
+    assert window.export_all_masks_button.toolTip().endswith("(enable Use mask on the Mask tab first)")
+    window.use_mask_checkbox.setChecked(True)
+    assert window.export_all_masks_button.isEnabled()
+    assert window.auto_import_masks_button.isEnabled()
+
+    custom = tmp_path / "custom.png"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(custom), ""))
+    window.mask_export_path_buttons["B2"].click()
+    first_path = Path(window.mask_export_paths["B1"])
+    Image.new("RGB", (4, 3), "white").save(first_path)
+    messages = []
+    questions = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: messages.append(args))
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: questions.append(args) or QMessageBox.StandardButton.No)
+    window.export_all_masks_button.click()
+    with Image.open(first_path) as saved:
+        assert np.all(np.asarray(saved.convert("RGB")) == 255)
+    for path in (custom, Path(window.mask_export_paths["A"])):
+        with Image.open(path) as saved:
+            assert np.all(np.asarray(saved.convert("RGB")) == 128)
+    assert len(questions) == 1
+    assert len(messages) == 1 and "Skipped or failed: B1" in messages[0][2]
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    window.export_all_masks_button.click()
+    with Image.open(first_path) as saved:
+        assert np.all(np.asarray(saved.convert("RGB")) == 128)
+    assert "Exported: B1, B2, A" in messages[-1][2]
+
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(first_path), ""))
+    window.mask_export_path_buttons["B2"].click()
+    window.export_all_masks_button.click()
+    assert "different export path" in warnings[-1][2]
+
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(custom), ""))
+    window.mask_export_path_buttons["B2"].click()
+    errors = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args))
+    original_export = image_data_colour.export_mask
+
+    def fail_b2(image, path):
+        if image.key == "B2":
+            raise OSError("test export failure")
+        return original_export(image, path)
+
+    monkeypatch.setattr(image_data_colour, "export_mask", fail_b2)
+    window.export_all_masks_button.click()
+    assert "B2" in errors[-1][2] and "test export failure" in errors[-1][2]
+    assert "Exported: B1, A" in messages[-1][2]
+    assert "Skipped or failed: B2" in messages[-1][2]
+
+
+def test_auto_import_uses_export_paths_and_reports_missing_or_invalid(window, monkeypatch, image_paths, tmp_path):
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    window.use_mask_checkbox.setChecked(True)
+    messages = []
+    warnings = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: messages.append(args))
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
+    window.auto_import_masks_button.click()
+    assert "Imported: none" in messages[-1][2]
+    assert "No mask found: B1, B2, A" in messages[-1][2]
+
+    custom = tmp_path / "existing.png"
+    Image.new("RGB", (4, 3), "black").save(custom)
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(custom), ""))
+    window.mask_export_path_buttons["B1"].click()
+    Image.new("RGB", (5, 3), "white").save(window.mask_export_paths["B2"])
+    window.mask_generate_buttons["B2"].click()
+    window.mask_generate_buttons["A"].click()
+    previous_b2 = window.images["B2"].masks
+    previous_a = window.images["A"].masks
+    window.auto_import_masks_button.click()
+    assert not np.any(window.images["B1"].masks["paper"])
+    assert np.all(window.images["B1"].masks["ink"])
+    assert all(window.images["B1"].masks_exists.values())
+    assert not window.mask_preview_labels["B1"].pixmap().isNull()
+    assert window.images["B2"].masks is previous_b2
+    assert window.images["A"].masks is previous_a
+    assert "Imported: B1" in warnings[-1][2]
+    assert "No mask found: A" in warnings[-1][2]
+    assert "B2" in warnings[-1][2] and "5 x 3" in warnings[-1][2]
 
 
 def test_select_previews_then_loads_all_images(window, monkeypatch, image_paths, tmp_path):

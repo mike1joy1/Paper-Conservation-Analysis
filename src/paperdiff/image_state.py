@@ -3,12 +3,32 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import numpy as np
+from PIL import Image
 from PySide6.QtGui import QColor
 from scipy.ndimage import binary_erosion
 
 from .loading import load_image
 
-__all__ = ["analysis_options", "image_data_colour"]
+__all__ = ["analysis_options", "image_data_colour", "mask_to_colour_image"]
+
+
+def mask_to_colour_image(paper_mask: np.ndarray, ink_mask: np.ndarray) -> np.ndarray:
+    """Encode paper and ink membership as an 8-bit RGB image."""
+    paper = np.asarray(paper_mask, dtype=bool)
+    ink = np.asarray(ink_mask, dtype=bool)
+    if paper.ndim == 3:
+        paper = paper[..., 0]
+    if ink.ndim == 3:
+        ink = ink[..., 0]
+    if paper.ndim != 2 or ink.shape != paper.shape:
+        raise ValueError("Paper and ink masks must have matching two-dimensional shapes.")
+
+    image = np.empty((*paper.shape, 3), dtype=np.uint8)
+    image[:] = (255, 0, 0)
+    image[paper & ~ink] = (255, 255, 255)
+    image[~paper & ink] = (0, 0, 0)
+    image[paper & ink] = (128, 128, 128)
+    return image
 
 
 class analysis_options:
@@ -155,6 +175,32 @@ class image_data_colour:
         array = self._mask_to_rgb(mask)
         self.masks[name] = array
         self.masks_exists[name] = True
+
+    def export_mask(self, path: str):
+        if self.pixels.get("rgb") is None:
+            raise ValueError("Load an image before exporting its mask.")
+        image = mask_to_colour_image(self.masks["paper"], self.masks["ink"])
+        Image.fromarray(image).save(path, format="PNG")
+
+    def import_mask(self, path: str):
+        rgb = self.get_pixels("rgb")
+        with Image.open(path) as image:
+            if image.size != (rgb.shape[1], rgb.shape[0]):
+                raise ValueError(
+                    f"Mask resolution {image.width} x {image.height} does not match "
+                    f"image resolution {rgb.shape[1]} x {rgb.shape[0]}."
+                )
+            pixels = np.asarray(image.convert("RGB"))
+        white = np.all(pixels == (255, 255, 255), axis=-1)
+        black = np.all(pixels == (0, 0, 0), axis=-1)
+        grey = np.all(pixels == (128, 128, 128), axis=-1)
+        paper = white | grey
+        ink = black | grey
+        masks = {"paper": self._mask_to_rgb(paper), "ink": self._mask_to_rgb(ink)}
+        border = self._mask_to_rgb(~paper & ~ink)
+        self.masks = masks
+        self.mask_border = border
+        self.masks_exists = {"paper": True, "ink": True}
 
     def load_from_path(self, path: str, check_cancelled: Callable[[], None] | None = None):
         self.file_path = path

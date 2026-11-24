@@ -5,6 +5,7 @@ and cropped before they reach this application, and the app focuses on the
 scientific comparison and report generation.
 """
 
+import os
 import sys
 import traceback
 from copy import copy
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -49,7 +51,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from paperdiff.image_state import analysis_options, image_data_colour
+from paperdiff.image_state import analysis_options, image_data_colour, mask_to_colour_image
 from paperdiff.loading import load_image
 from paperdiff.stats import verdict_for_region
 from paperdiff.workflow import describe_region_change, image_analysis_b1_b2_a
@@ -614,15 +616,10 @@ class MainWindow(QMainWindow):
         label.setPixmap(fit_pixmap)
 
     def _display_mask_preview(self, label: QLabel, mask_array=None, border_mask=None, paper_mask=None, ink_mask=None):
-        """Render the classification as white paper, black ink, and red for pixels in neither mask."""
+        """Render paper, ink, overlapping, and excluded mask pixels."""
         if paper_mask is not None and ink_mask is not None:
-            paper = _as_bool_mask(paper_mask)
-            ink = _as_bool_mask(ink_mask)
-            h, w = paper.shape
-            rendered = np.zeros((h, w, 3), dtype=np.uint8)
-            rendered[paper] = [255, 255, 255]
-            rendered[ink] = [0, 0, 0]
-            rendered[~paper & ~ink] = [255, 0, 0]
+            rendered = mask_to_colour_image(paper_mask, ink_mask)
+            h, w = rendered.shape[:2]
         else:
             if mask_array is None:
                 label.setText("No mask")
@@ -828,6 +825,7 @@ class MainWindow(QMainWindow):
                 return
 
             pixmaps = {key: QPixmap.fromImage(image) for key, image in thread.previews.items()}
+            previous_paths = {key: image.file_path for key, image in self.images.items()}
             self.images = thread.images
             self.analysis_options.int_paper_mask = None
             self.analysis_options.int_ink_mask = None
@@ -835,6 +833,11 @@ class MainWindow(QMainWindow):
                 self.mask_original_labels[key].setPixmap(pixmap, preserve_zoom=True)
                 self.mask_preview_labels[key].clear()
                 self.mask_preview_labels[key].setText(f"Mask {key}")
+                image_path = Path(self.images[key].file_path)
+                if previous_paths[key] != str(image_path) or not self.mask_export_paths[key]:
+                    self.mask_export_paths[key] = str(image_path.with_name(f"{image_path.stem}_mask.png"))
+                self.mask_export_path_fields[key].setText(self.mask_export_paths[key])
+            self._update_mask_file_controls()
             self._update_alignment_mode_availability()
             self._display_alignment_image()
             self.report.clear()
@@ -1091,7 +1094,9 @@ class MainWindow(QMainWindow):
         self.original_radio = QRadioButton("Original")
         self.original_radio.setToolTip("Show the selected image without a mask overlay.")
         self.mask_radio = QRadioButton("Mask")
-        self.mask_radio.setToolTip("When masks are enabled, show paper in white, ink in black, and excluded pixels in red.")
+        self.mask_radio.setToolTip(
+            "When masks are enabled, show paper in white, ink in black, both in grey, and excluded pixels in red."
+        )
         self.masked_paper_radio = QRadioButton("Paper mask")
         self.masked_paper_radio.setToolTip("When masks are enabled, colour pixels outside the paper mask.")
         self.masked_ink_radio = QRadioButton("Ink mask")
@@ -1280,6 +1285,7 @@ class MainWindow(QMainWindow):
                 border_mask=image_data.mask_border,
             )
 
+        self._update_mask_file_controls()
         self._display_alignment_image()
 
     def _generate_mask_for_all(self):
@@ -1297,7 +1303,124 @@ class MainWindow(QMainWindow):
             self.mask_preview_labels[key].clear()
             self.mask_preview_labels[key].setText(f"Mask {key}")
 
+        self._update_mask_file_controls()
         self._display_alignment_image()
+
+    def _import_mask_for_key(self, key: str):
+        image_data = self.images[key]
+        if not self._ensure_image_loaded_for_key(key):
+            QMessageBox.warning(self, "Missing image", f"Load {key} before importing a mask.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Import mask for {key}", str(Path(image_data.file_path).parent),
+            "Images (*.png *.bmp *.tif *.tiff *.jpg *.jpeg)",
+        )
+        if not path:
+            return
+        try:
+            self._import_mask_from_path(key, path)
+        except (OSError, ValueError, Image.DecompressionBombError) as exc:
+            QMessageBox.critical(self, "Mask import failed", f"Unable to import the mask for {key}:\n{exc}")
+
+    def _import_mask_from_path(self, key: str, path: str):
+        image_data = self.images[key]
+        image_data.import_mask(path)
+        self._display_mask_preview(
+            self.mask_preview_labels[key],
+            paper_mask=image_data.masks["paper"],
+            ink_mask=image_data.masks["ink"],
+        )
+        self._update_mask_file_controls()
+        self._display_alignment_image()
+
+    def _auto_import_masks(self):
+        imported = []
+        missing = []
+        errors = []
+        for key, path in self.mask_export_paths.items():
+            if not path:
+                errors.append(f"{key}: no export path is set")
+            else:
+                try:
+                    self._import_mask_from_path(key, path)
+                except FileNotFoundError:
+                    missing.append(key)
+                except (OSError, ValueError, Image.DecompressionBombError) as exc:
+                    errors.append(f"{key} ({path}): {exc}")
+                else:
+                    imported.append(key)
+
+        details = [f"Imported: {', '.join(imported) if imported else 'none'}."]
+        if missing:
+            details.append(f"No mask found: {', '.join(missing)}.")
+        if errors:
+            details.append("Import failed:\n" + "\n".join(errors))
+            QMessageBox.warning(self, "Auto-import masks", "\n".join(details))
+        else:
+            QMessageBox.information(self, "Auto-import masks", "\n".join(details))
+
+    def _set_mask_export_path_for_key(self, key: str):
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"Set mask export path for {key}", self.mask_export_paths[key],
+            "PNG images (*.png)", options=QFileDialog.Option.DontConfirmOverwrite,
+        )
+        if not path:
+            return
+        if not Path(path).suffix:
+            path += ".png"
+        if Path(path).suffix.lower() != ".png":
+            QMessageBox.warning(self, "Invalid export path", "Choose a PNG file to preserve the mask colours.")
+            return
+        self.mask_export_paths[key] = path
+        self.mask_export_path_fields[key].setText(path)
+
+    def _export_mask_for_key(self, key: str, *, notify: bool = True):
+        path = self.mask_export_paths[key]
+        if not path:
+            QMessageBox.warning(self, "Missing export path", f"Load {key} before exporting a mask.")
+            return False
+        if Path(path).exists() and QMessageBox.question(
+            self, "Overwrite mask?", f"{path} already exists. Replace it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return False
+        try:
+            self.images[key].export_mask(path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Mask export failed", f"Unable to export the mask for {key}:\n{exc}")
+            return False
+        if notify:
+            QMessageBox.information(self, "Mask exported", f"Mask saved to:\n{path}")
+        return True
+
+    def _export_all_masks(self):
+        paths = [os.path.normcase(os.path.realpath(path)) for path in self.mask_export_paths.values() if path]
+        if len(set(paths)) != len(paths):
+            QMessageBox.warning(self, "Mask export failed", "Choose a different export path for each image.")
+            return
+        exported = []
+        skipped = []
+        for key in self.mask_export_paths:
+            if self._export_mask_for_key(key, notify=False):
+                exported.append(key)
+            else:
+                skipped.append(key)
+        details = [f"Exported: {', '.join(exported) if exported else 'none'}."]
+        if skipped:
+            details.append(f"Skipped or failed: {', '.join(skipped)}.")
+        QMessageBox.information(self, "Export all masks", "\n".join(details))
+
+    def _update_mask_file_controls(self):
+        if not hasattr(self, "mask_export_buttons"):
+            return
+        enabled = self.use_mask_checkbox.isChecked()
+        self.auto_import_masks_button.setEnabled(enabled)
+        self.export_all_masks_button.setEnabled(enabled)
+        for key in self.mask_export_buttons:
+            self.mask_import_buttons[key].setEnabled(enabled)
+            self.mask_export_path_buttons[key].setEnabled(enabled)
+            self.mask_export_buttons[key].setEnabled(enabled)
+        self._refresh_disabled_tooltips()
 
     def _update_mask_generation_button_text(self):
         if not hasattr(self, "mask_generate_buttons"):
@@ -1367,6 +1490,7 @@ class MainWindow(QMainWindow):
             for label in self.mask_original_labels.values():
                 label.setEnabled(enabled)
 
+        self._update_mask_file_controls()
         if hasattr(self, "alignment_preview"):
             self._display_alignment_image()
         self._refresh_disabled_tooltips()
@@ -1458,6 +1582,11 @@ class MainWindow(QMainWindow):
         self.ink_colour_buttons = {}
         self.mask_generate_buttons = {}
         self.mask_remove_buttons = {}
+        self.mask_import_buttons = {}
+        self.mask_export_buttons = {}
+        self.mask_export_path_buttons = {}
+        self.mask_export_path_fields = {}
+        self.mask_export_paths = {}
         grid = QGridLayout()
         grid.setAlignment(Qt.AlignTop)
         grid.setHorizontalSpacing(8)
@@ -1465,6 +1594,7 @@ class MainWindow(QMainWindow):
         for col, key in enumerate(["B1", "B2", "A"]):
             card = QWidget()
             card_layout = QVBoxLayout(card)
+            card_layout.setSpacing(3)
 
             original_preview = ZoomableLabel(f"Original {key}")
             original_preview.setAlignment(Qt.AlignCenter)
@@ -1495,13 +1625,38 @@ class MainWindow(QMainWindow):
             button.setToolTip(f"Generate paper and ink masks for {self.image_key_labels[key]} using the current settings.")
             button.setMinimumWidth(120)
             button.clicked.connect(lambda checked, value=key: self._generate_mask_for_key(value))
-            card_layout.addWidget(button)
-
             remove_button = QPushButton(f"Remove mask for {key}")
             remove_button.setToolTip(f"Remove the generated masks for {self.image_key_labels[key]}.")
             remove_button.setMinimumWidth(120)
             remove_button.clicked.connect(lambda checked, value=key: self._remove_mask_for_key(value))
-            card_layout.addWidget(remove_button)
+            mask_row = QHBoxLayout()
+            mask_row.addWidget(button)
+            mask_row.addWidget(remove_button)
+            card_layout.addLayout(mask_row)
+
+            file_row = QHBoxLayout()
+            import_button = QPushButton("Import mask")
+            import_button.setToolTip(f"Import a colour mask for {self.image_key_labels[key]}.")
+            import_button.clicked.connect(lambda checked, value=key: self._import_mask_for_key(value))
+            export_button = QPushButton("Export mask")
+            export_button.setToolTip(f"Export the mask for {self.image_key_labels[key]} as a PNG image.")
+            export_button.clicked.connect(lambda checked, value=key: self._export_mask_for_key(value))
+            file_row.addWidget(import_button)
+            file_row.addWidget(export_button)
+            card_layout.addLayout(file_row)
+
+            export_path_button = QPushButton("Set export path")
+            export_path_button.setToolTip(f"Choose the mask export folder and filename for {self.image_key_labels[key]}.")
+            export_path_button.clicked.connect(lambda checked, value=key: self._set_mask_export_path_for_key(value))
+            export_path_field = QLineEdit()
+            export_path_field.setReadOnly(True)
+            export_path_field.setPlaceholderText("Export path set when image is loaded")
+            export_path_field.setToolTip(f"Current mask export path for {self.image_key_labels[key]}.")
+            export_path_field.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            path_row = QHBoxLayout()
+            path_row.addWidget(export_path_button)
+            path_row.addWidget(export_path_field)
+            card_layout.addLayout(path_row)
 
             self.mask_original_labels[key] = original_preview
             self.mask_preview_labels[key] = mask_preview
@@ -1509,6 +1664,11 @@ class MainWindow(QMainWindow):
             self.ink_colour_buttons[key] = ink_button
             self.mask_generate_buttons[key] = button
             self.mask_remove_buttons[key] = remove_button
+            self.mask_import_buttons[key] = import_button
+            self.mask_export_buttons[key] = export_button
+            self.mask_export_path_buttons[key] = export_path_button
+            self.mask_export_path_fields[key] = export_path_field
+            self.mask_export_paths[key] = ""
             grid.addWidget(card, 0, col)
 
         self.change_all_paper_button = QPushButton("Set all paper colours")
@@ -1528,12 +1688,21 @@ class MainWindow(QMainWindow):
         self.generate_all_masks_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.generate_all_masks_button.clicked.connect(self._generate_mask_for_all)
 
+        self.export_all_masks_button = QPushButton("Export all masks")
+        self.export_all_masks_button.setToolTip("Export each mask to its configured path, confirming before overwriting.")
+        self.export_all_masks_button.clicked.connect(self._export_all_masks)
+        self.auto_import_masks_button = QPushButton("Auto-import masks")
+        self.auto_import_masks_button.setToolTip("Import masks found at the configured export paths for all images.")
+        self.auto_import_masks_button.clicked.connect(self._auto_import_masks)
+
         bulk_actions_row = QHBoxLayout()
         bulk_actions_row.setContentsMargins(0, 0, 0, 0)
         bulk_actions_row.setAlignment(Qt.AlignLeft)
         bulk_actions_row.addWidget(self.change_all_paper_button)
         bulk_actions_row.addWidget(self.change_all_ink_button)
         bulk_actions_row.addWidget(self.generate_all_masks_button)
+        bulk_actions_row.addWidget(self.export_all_masks_button)
+        bulk_actions_row.addWidget(self.auto_import_masks_button)
         bulk_actions_row.addStretch(1)
         settings_layout.addLayout(bulk_actions_row)
 
