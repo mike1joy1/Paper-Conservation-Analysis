@@ -1206,6 +1206,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, "use_mask_checkbox"):
             self.use_mask_checkbox.setChecked(enabled)
 
+        if not enabled:
+            self.analysis_options.use_masks = False
+        if hasattr(self, "use_masks_checkbox"):
+            self._refresh_analysis_options_state()
+
         if hasattr(self, "mask_mode_group"):
             for button in self.mask_mode_group.buttons():
                 button.setEnabled(enabled)
@@ -1268,7 +1273,7 @@ class MainWindow(QMainWindow):
         layout.setAlignment(Qt.AlignTop)
 
         self.use_mask_checkbox = QCheckBox("Use mask")
-        self.use_mask_checkbox.setChecked(True)
+        self.use_mask_checkbox.setChecked(False)
         self.use_mask_checkbox.toggled.connect(lambda checked: self._set_mask_controls_enabled(checked))
         layout.addWidget(self.use_mask_checkbox)
 
@@ -1436,6 +1441,9 @@ class MainWindow(QMainWindow):
                 widget.blockSignals(True)
                 widget.setChecked(value)
                 widget.blockSignals(False)
+
+        if hasattr(self, "use_masks_checkbox"):
+            self.use_masks_checkbox.setEnabled(self.use_mask_checkbox.isChecked())
 
         if hasattr(self, "heatmap_grid_slider_x"):
             slider = self.heatmap_grid_slider_x
