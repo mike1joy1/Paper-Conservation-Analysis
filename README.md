@@ -9,8 +9,8 @@ This app is designed for a simple conservation workflow:
 - Select and preview three images: 2x before images (B1 and B2) and one after image (A), then click **Load images** to prepare them for analysis
 - Review and adjust masks for paper and ink regions
 - Check image alignment visually
-- Compare the images using configured analysis options
-- View a concise report describing mean and per-pixel differences
+- Configure the options on the **Analysis** tab and click **Analyse**
+- View the data report in **Results data**; **Image results** is reserved for future image outputs
 
 ## Features
 
@@ -68,3 +68,5 @@ This project assumes the images have already been colour corrected and aligned a
 Mean-colour distances are calculated separately from B1 to A and B2 to A, then reported as their average ± half their absolute difference. RGB distances use the report's 0–100 channel scale; redmean weights are calculated from the mean red channel on the conventional 0–255 scale. RGB Euclidean and redmean distances are not CIELAB ΔE values and should not be compared directly with them.
 
 Selecting a new image requires loading the selected set again before masking, alignment, or analysis. Loading the set resets any generated masks and the previous report.
+
+Analysis runs in the background. The Analysis tab shows the current task and progress as a percentage of completed tasks; tasks may take different amounts of time. Image and analysis settings cannot be changed until it finishes. Closing the window during analysis waits for the current run to finish.

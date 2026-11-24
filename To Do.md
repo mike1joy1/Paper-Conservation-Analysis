@@ -1,5 +1,8 @@
 TO DO
 
+Heatmaps
+- Generate heatmaps and find way to display and save
+
 Data
 - Roughness measure for different scales (using convolutions / blur at different scales and taking the SD)
 

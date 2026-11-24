@@ -63,6 +63,34 @@ def test_rgb_distances_use_report_scale_and_redmean_weights():
         rgb_distance_dict([0.0, 0.0], black)
 
 
+@pytest.mark.parametrize(
+    ("rgb", "lab", "expected"),
+    [
+        (False, False, ["Preparing masks and image data"]),
+        (True, False, ["Preparing masks and image data", "Analysing RGB colours"]),
+        (False, True, ["Preparing masks and image data", "Analysing CIELAB colours"]),
+        (True, True, ["Preparing masks and image data", "Analysing RGB colours", "Analysing CIELAB colours"]),
+    ],
+)
+def test_analysis_progress_follows_enabled_tasks_without_changing_results(rgb, lab, expected):
+    images = []
+    for key in ("b1", "b2", "a"):
+        image = image_data_colour(key)
+        image.pixels["rgb"] = np.full((2, 2, 3), 0.5, dtype=np.float32)
+        image.clear_masks()
+        images.append(image)
+    options = analysis_options()
+    options.rgb_comparison = rgb
+    options.lab_comparison = lab
+    stages = []
+
+    baseline = image_analysis_b1_b2_a(*images, options)
+    result = image_analysis_b1_b2_a(*images, options, progress=stages.append)
+
+    assert stages == expected
+    assert result == baseline
+
+
 @pytest.mark.parametrize("use_masks", [False, True])
 def test_rgb_distances_in_report_with_before_uncertainty(use_masks):
     images = []

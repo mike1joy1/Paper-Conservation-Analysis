@@ -6,8 +6,8 @@ scientific comparison and report generation.
 """
 
 import sys
-import os
 import traceback
+from copy import copy
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +20,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from PySide6.QtCore import Qt, QSize, Signal
+from PySide6.QtCore import Qt, QSize, QThread, Signal, Slot
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QSizePolicy,
@@ -48,6 +49,70 @@ from paperdiff.image_state import analysis_options, image_data_colour
 from paperdiff.loading import load_image
 from paperdiff.stats import verdict_for_region
 from paperdiff.workflow import describe_region_change, image_analysis_b1_b2_a
+
+
+def _as_bool_mask(mask):
+    """Convert 2D or 3-channel mask arrays to a 2D bool mask."""
+    if mask is None:
+        return None
+    array = np.asarray(mask, dtype=np.float32)
+    if array.ndim == 3:
+        array = array[..., 0]
+    return array.astype(bool)
+
+
+def _intersection_masks(images):
+    mask_papers = []
+    mask_inks = []
+    for key in ["B1", "B2", "A"]:
+        image_data = images[key]
+        if image_data.pixels.get("rgb") is None:
+            return None, None
+
+        paper_mask = _as_bool_mask(image_data.masks.get("paper"))
+        ink_mask = _as_bool_mask(image_data.masks.get("ink"))
+        h, w = image_data.get_pixels("rgb").shape[:2]
+        if paper_mask is None:
+            paper_mask = np.ones((h, w), dtype=bool)
+        if ink_mask is None:
+            ink_mask = np.ones((h, w), dtype=bool)
+        mask_papers.append(paper_mask)
+        mask_inks.append(ink_mask)
+
+    pm = np.logical_and.reduce(mask_papers)
+    im = np.logical_and.reduce(mask_inks)
+    return np.repeat(pm[..., np.newaxis], 3, axis=-1), np.repeat(im[..., np.newaxis], 3, axis=-1)
+
+
+class AnalysisThread(QThread):
+    """Run the analysis without accessing UI widgets."""
+
+    progress = Signal(int, int, str)
+
+    def __init__(self, images, options, parent=None):
+        super().__init__(parent)
+        self.images = images
+        self.options = copy(options)
+        self.result = None
+        self.error = None
+        self.use_intersection = self.options.images_aligned and self.options.use_masks and self.options.intersection_mask
+        self.total_tasks = 1 + int(self.options.rgb_comparison) + int(self.options.lab_comparison) + int(self.use_intersection)
+        self.current_task = 0
+
+    def _start_task(self, description):
+        self.current_task += 1
+        self.progress.emit(self.current_task, self.total_tasks, description)
+
+    def run(self):
+        try:
+            if self.use_intersection:
+                self._start_task("Calculating intersection masks")
+                self.options.int_paper_mask, self.options.int_ink_mask = _intersection_masks(self.images)
+            self.result = image_analysis_b1_b2_a(
+                self.images["B1"], self.images["B2"], self.images["A"], self.options, progress=self._start_task
+            )
+        except Exception:
+            self.error = traceback.format_exc()
 
 
 class ZoomableLabel(QLabel):
@@ -238,7 +303,7 @@ class ClickableLabel(ZoomableLabel):
 
 
 class MainWindow(QMainWindow):
-    """The main window containing the five-step analysis workflow."""
+    """The main window containing the analysis workflow."""
 
     def __init__(self):
         super().__init__()
@@ -256,6 +321,8 @@ class MainWindow(QMainWindow):
         self.alignment_display_mode = "original"
         self.mask_overlay_colour = QColor("blue")
         self.mask_mode = "luminance"
+        self._analysis_thread = None
+        self._close_after_analysis = False
 
         self.tab_widget = QTabWidget()
         self.setCentralWidget(self.tab_widget)
@@ -265,18 +332,28 @@ class MainWindow(QMainWindow):
         self.check_alignment_tab = self._create_check_alignment_tab()
         self.analysis_options_tab = self._create_analysis_options_tab()
         self.results_tab = self._create_results_tab()
+        self.image_results_tab = self._create_image_results_tab()
 
         self.tab_widget.addTab(self.load_tab, "1) Load images")
         self.tab_widget.addTab(self.mask_tab, "2) Mask")
         self.tab_widget.addTab(self.check_alignment_tab, "3) Check alignment")
-        self.tab_widget.addTab(self.analysis_options_tab, "4) Analysis options")
-        self.tab_widget.addTab(self.results_tab, "5) Results")
+        self.tab_widget.addTab(self.analysis_options_tab, "4) Analysis")
+        self.tab_widget.addTab(self.results_tab, "5) Results data")
+        self.tab_widget.addTab(self.image_results_tab, "6) Image results")
 
         self._refresh_preview_box_sizes()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_preview_box_sizes()
+
+    def closeEvent(self, event):
+        if self._analysis_thread is not None:
+            self._close_after_analysis = True
+            self.analysis_progress_label.setText("Analysis is finishing; the window will close when it is done.")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _refresh_preview_box_sizes(self):
         """Keep the small preview cards and the alignment viewer scaled by the current window size, without forcing fixed internal viewport dimensions."""
@@ -344,23 +421,11 @@ class MainWindow(QMainWindow):
         painter.end()
         label.setPixmap(fit_pixmap)
 
-    def _as_bool_mask(self, mask):
-        """Convert 2D or 3-channel mask arrays to a 2D bool mask for UI logic."""
-        if mask is None:
-            return None
-        array = np.asarray(mask, dtype=np.float32)
-        if array.ndim == 3:
-            if array.shape[-1] == 1:
-                array = array[..., 0]
-            else:
-                array = array[..., 0]
-        return array.astype(bool)
-
     def _display_mask_preview(self, label: QLabel, mask_array=None, border_mask=None, paper_mask=None, ink_mask=None):
         """Render the classification as white paper, black ink, and red for pixels in neither mask."""
         if paper_mask is not None and ink_mask is not None:
-            paper = self._as_bool_mask(paper_mask)
-            ink = self._as_bool_mask(ink_mask)
+            paper = _as_bool_mask(paper_mask)
+            ink = _as_bool_mask(ink_mask)
             h, w = paper.shape
             rendered = np.zeros((h, w, 3), dtype=np.uint8)
             rendered[paper] = [255, 255, 255]
@@ -372,11 +437,11 @@ class MainWindow(QMainWindow):
                 label.setPixmap(QPixmap())
                 return
 
-            mask = self._as_bool_mask(mask_array)
+            mask = _as_bool_mask(mask_array)
             if border_mask is None:
                 border_mask = mask ^ binary_erosion(mask, iterations=1)
             else:
-                border_mask = self._as_bool_mask(border_mask)
+                border_mask = _as_bool_mask(border_mask)
 
             h, w = mask.shape
             rendered = np.zeros((h, w, 3), dtype=np.uint8)
@@ -506,7 +571,10 @@ class MainWindow(QMainWindow):
         self.image_details_labels[key].setText(self._image_file_details(path))
         self.load_images_button.setEnabled(all(self.selected_image_paths.values()))
         self.load_status_label.setText("Selection changed. Select all three images and click Load images.")
-        for tab in (self.mask_tab, self.check_alignment_tab, self.results_tab):
+        self.analyze_button.setEnabled(False)
+        self.analysis_progress_bar.setValue(0)
+        self.analysis_progress_label.setText("Load the selected images before analysis.")
+        for tab in (self.mask_tab, self.check_alignment_tab, self.results_tab, self.image_results_tab):
             self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
 
     def _load_selected_images(self):
@@ -546,7 +614,10 @@ class MainWindow(QMainWindow):
         self.report.clear()
         self.status_label.setText("Images loaded. Run the analysis to create a report.")
         self.load_status_label.setText("Images loaded.")
-        for tab in (self.mask_tab, self.check_alignment_tab, self.results_tab):
+        self.analyze_button.setEnabled(True)
+        self.analysis_progress_bar.setValue(0)
+        self.analysis_progress_label.setText("Ready to analyse.")
+        for tab in (self.mask_tab, self.check_alignment_tab, self.results_tab, self.image_results_tab):
             self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), True)
 
     def _create_load_tab(self):
@@ -628,37 +699,7 @@ class MainWindow(QMainWindow):
 
     def _get_intersection_masks_for_alignment(self):
         """Return the intersection paper and ink masks across all loaded images when alignment mode is enabled."""
-        mask_papers = []
-        mask_inks = []
-
-        for key in ["B1", "B2", "A"]:
-            image_data = self.images[key]
-            if image_data.pixels.get("rgb") is None:
-                return None, None
-
-            paper_mask = self._as_bool_mask(image_data.masks.get("paper"))
-            ink_mask = self._as_bool_mask(image_data.masks.get("ink"))
-            array = np.asarray(image_data.get_pixels("rgb"))
-            h, w = array.shape[:2]
-
-            if paper_mask is None:
-                paper_mask = np.ones((h, w), dtype=bool)
-            if ink_mask is None:
-                ink_mask = np.ones((h, w), dtype=bool)
-
-            mask_papers.append(np.asarray(paper_mask, dtype=bool))
-            mask_inks.append(np.asarray(ink_mask, dtype=bool))
-
-        if not mask_papers:
-            return None, None
-
-        pm = np.logical_and.reduce(mask_papers)
-        im = np.logical_and.reduce(mask_inks)
-
-        pm = np.repeat(pm[..., np.newaxis], 3, axis=-1)
-        im = np.repeat(im[..., np.newaxis], 3, axis=-1)
-
-        return pm, im
+        return _intersection_masks(self.images)
 
     def _display_alignment_image(self):
         """Show one of the three images in the alignment check area."""
@@ -711,8 +752,8 @@ class MainWindow(QMainWindow):
             array = np.repeat(array, 3, axis=-1)
         array = np.clip(array, 0.0, 1.0)
 
-        paper_bool = self._as_bool_mask(paper_mask)
-        ink_bool = self._as_bool_mask(ink_mask)
+        paper_bool = _as_bool_mask(paper_mask)
+        ink_bool = _as_bool_mask(ink_mask)
         overlay = np.array(self.mask_overlay_colour.getRgb()[:3], dtype=np.float32) / 255.0
         displayed = array.copy()
 
@@ -1284,15 +1325,15 @@ class MainWindow(QMainWindow):
                 self.heatmap_grid_slider_y.setEnabled(True)
 
     def _create_analysis_options_tab(self):
-        """Tab 4: collect comparison and masking settings for later analysis."""
+        """Tab 4: configure and run the analysis."""
         page = QWidget()
         page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignTop)
 
-        options_group = QGroupBox("Comparison settings")
-        options_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        options_layout = QVBoxLayout(options_group)
+        self.analysis_settings_group = QGroupBox("Comparison settings")
+        self.analysis_settings_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        options_layout = QVBoxLayout(self.analysis_settings_group)
 
         self.show_anaysis_options_checkbox = QCheckBox("Show analysis options")
         self.show_anaysis_options_checkbox.setChecked(self.analysis_options.show_analysis_options)
@@ -1387,12 +1428,23 @@ class MainWindow(QMainWindow):
         options_layout.addWidget(heatmap_label_y)
         options_layout.addWidget(self.heatmap_grid_slider_y)
 
-        layout.addWidget(options_group)
+        layout.addWidget(self.analysis_settings_group)
+        self.analyze_button = QPushButton("Analyse")
+        self.analyze_button.setFixedWidth(170)
+        self.analyze_button.clicked.connect(self.analyze_images)
+        layout.addWidget(self.analyze_button, alignment=Qt.AlignLeft)
+        self.analysis_progress_bar = QProgressBar()
+        self.analysis_progress_bar.setRange(0, 100)
+        self.analysis_progress_bar.setValue(0)
+        layout.addWidget(self.analysis_progress_bar)
+        self.analysis_progress_label = QLabel("Ready to analyse.")
+        self.analysis_progress_label.setWordWrap(True)
+        layout.addWidget(self.analysis_progress_label)
         self._refresh_analysis_options_state()
         return page
 
     def _create_results_tab(self):
-        """Tab 5: run the analysis and display a readable report."""
+        """Tab 5: display the analysis data report."""
         page = QWidget()
         page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         layout = QVBoxLayout(page)
@@ -1403,15 +1455,6 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("font-size: 15px; margin: 8px;")
         layout.addWidget(self.status_label)
 
-        analyze_button = QPushButton("Analyse")
-        analyze_button.setFixedWidth(170)
-        analyze_button.clicked.connect(self.analyze_images)
-        button_row = QHBoxLayout()
-        button_row.setAlignment(Qt.AlignLeft)
-        button_row.addWidget(analyze_button)
-        button_row.addStretch(1)
-        layout.addLayout(button_row)
-
         self.report = QTextEdit()
         self.report.setReadOnly(True)
         report_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
@@ -1420,6 +1463,14 @@ class MainWindow(QMainWindow):
         self.report.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.report.setPlaceholderText("Analysis summary will appear here.")
         layout.addWidget(self.report)
+        return page
+
+    def _create_image_results_tab(self):
+        """Tab 6: reserve a place for future image results."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setAlignment(Qt.AlignTop)
+        layout.addWidget(QLabel("Image results are not available yet."))
         return page
 
     def dict_to_string(self, d, indent=" "*4, section_break="", _level=0):
@@ -1443,31 +1494,61 @@ class MainWindow(QMainWindow):
         return separator.join(blocks)
 
     def analyze_images(self):
-        """Run the comparison for the three loaded images and report the result."""
-        
+        """Start the comparison for the three loaded images."""
+        if self._analysis_thread is not None or not self.analyze_button.isEnabled():
+            return
         if any(self.images[key].pixels.get("rgb") is None for key in ["B1", "B2", "A"]):
             QMessageBox.warning(self, "Missing input", "Load B1, B2, and A before running the analysis.")
             return
+
+        self._analysis_tab_states = {
+            self.tab_widget.indexOf(tab): self.tab_widget.isTabEnabled(self.tab_widget.indexOf(tab))
+            for tab in (self.load_tab, self.mask_tab, self.check_alignment_tab)
+        }
+        for index in self._analysis_tab_states:
+            self.tab_widget.setTabEnabled(index, False)
+        self.analysis_settings_group.setEnabled(False)
+        self.analyze_button.setEnabled(False)
+        self.analysis_progress_label.setText("Starting analysis...")
+        self.analysis_progress_bar.setValue(0)
+        self.status_label.setText("Analysis in progress. The previous report remains visible until it completes.")
+
+        self._analysis_thread = AnalysisThread(self.images, self.analysis_options, self)
+        self._analysis_thread.progress.connect(self._analysis_progress)
+        self._analysis_thread.finished.connect(self._analysis_finished)
+        self._analysis_thread.start()
+
+    @Slot(int, int, str)
+    def _analysis_progress(self, task, total, description):
+        self.analysis_progress_bar.setValue((task - 1) * 100 // total)
+        suffix = " (closing when finished)" if self._close_after_analysis else ""
+        self.analysis_progress_label.setText(f"Task {task}/{total}: {description}{suffix}")
+
+    def _analysis_finished(self):
+        thread = self._analysis_thread
+        self._analysis_thread = None
+        self.analysis_settings_group.setEnabled(True)
+        self.analyze_button.setEnabled(True)
+        for index, enabled in self._analysis_tab_states.items():
+            self.tab_widget.setTabEnabled(index, enabled)
         try:
-
-            #Set up analysis options
-            if self.analysis_options.images_aligned and self.analysis_options.use_masks and self.analysis_options.intersection_mask:
-                paper_mask, ink_mask = self._get_intersection_masks_for_alignment()
-                self.analysis_options.int_paper_mask = paper_mask
-                self.analysis_options.int_ink_mask = ink_mask 
-            
-            results = image_analysis_b1_b2_a(self.images["B1"], self.images["B2"], self.images["A"], self.analysis_options)
-            
-            summary_lines = self.dict_to_string(results,indent=" "*4, section_break="\n"+("-" * 64)+"\n")
-
-            self.report.setPlainText(summary_lines+"\n")
-            
+            if thread.error is not None:
+                raise RuntimeError(thread.error)
+            summary_lines = self.dict_to_string(thread.result, indent=" "*4, section_break="\n"+("-" * 64)+"\n")
+            self.report.setPlainText(summary_lines + "\n")
             self.status_label.setText("Analysis complete. The report compares B1 against both B2 and A.")
-            
+            self.analysis_progress_label.setText(f"Analysis complete ({thread.total_tasks}/{thread.total_tasks} tasks).")
+            self.analysis_progress_bar.setValue(100)
+            if not self._close_after_analysis:
+                self.tab_widget.setCurrentWidget(self.results_tab)
         except Exception as exc:
-            exc_type, exc_obj, exc_tb = sys.exc_info()
-            fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
-            QMessageBox.critical(self, "Analysis failed", f"Unable to analyze the images:\n{exc}\n\n{traceback.format_exc()}")
+            self.status_label.setText("Analysis failed. The previous report is unchanged.")
+            self.analysis_progress_label.setText(f"Analysis failed. {self.analysis_progress_label.text()}")
+            QMessageBox.critical(self, "Analysis failed", f"Unable to analyze the images:\n{exc}")
+        finally:
+            thread.deleteLater()
+            if self._close_after_analysis:
+                self.close()
 
 
 if __name__ == "__main__":

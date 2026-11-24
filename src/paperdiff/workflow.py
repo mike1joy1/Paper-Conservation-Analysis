@@ -9,6 +9,8 @@ reference image and the comparison images.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
+
 import numpy as np
 from PIL import Image
 from skimage.color import deltaE_ciede94, deltaE_ciede2000, deltaE_cmc
@@ -535,15 +537,20 @@ def format_data_out(raw_data, paper_diff_text, ink_diff_text, c0, c1, c2, use_ma
 
 
 
-def image_analysis_b1_b2_a(b1: image_data_colour, b2: image_data_colour, a: image_data_colour, op: analysis_options) -> dict:
-    """Compare B1 with B2 and A using the already-aligned input images.
+def image_analysis_b1_b2_a(
+    b1: image_data_colour,
+    b2: image_data_colour,
+    a: image_data_colour,
+    op: analysis_options,
+    progress: Callable[[str], None] | None = None,
+) -> dict:
+    """Compare B1 and B2 with A and return the formatted analysis data.
 
-    The workflow:
-    1. Build a paper/ink mask from B1.
-    2. Compute per-pixel colour deltas between B1 and each comparison image.
-    3. Summarise the change in the paper and ink regions.
-    4. Return the raw numbers and a simple score for each comparison.
+    If provided, progress is called with each task's description as it starts.
     """
+
+    if progress is not None:
+        progress("Preparing masks and image data")
 
     # Output options
     results = dict()
@@ -679,6 +686,8 @@ def image_analysis_b1_b2_a(b1: image_data_colour, b2: image_data_colour, a: imag
     
     # RGB comparisons
     if op.rgb_comparison:
+        if progress is not None:
+            progress("Analysing RGB colours")
         rgb_scale = 100.0
         rgb = {
             "b1": b1.get_pixels("rgb"),
@@ -755,6 +764,8 @@ def image_analysis_b1_b2_a(b1: image_data_colour, b2: image_data_colour, a: imag
 
     # LAB comparisons
     if op.lab_comparison:
+        if progress is not None:
+            progress("Analysing CIELAB colours")
         lab_scale = 1.0
         lab = {
             "b1": b1.get_pixels("lab"),
