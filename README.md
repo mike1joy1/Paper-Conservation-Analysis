@@ -6,7 +6,7 @@ A desktop application for comparing images of paper (with ink) and reporting vis
 
 This app is designed for a simple conservation workflow:
 
-- Load three images: 2x before images (B1 and B2) and one after image (A)
+- Select and preview three images: 2x before images (B1 and B2) and one after image (A), then click **Load images** to prepare them for analysis
 - Review and adjust masks for paper and ink regions
 - Check image alignment visually
 - Compare the images using configured analysis options
@@ -66,3 +66,5 @@ python main.py
 This project assumes the images have already been colour corrected and aligned and cropped before they are loaded into the application (e.g. using Auto-Align Layers in Photoshop). The app focuses on the comparison and reporting workflow rather than image preparation.
 
 Mean-colour distances are calculated separately from B1 to A and B2 to A, then reported as their average ± half their absolute difference. RGB distances use the report's 0–100 channel scale; redmean weights are calculated from the mean red channel on the conventional 0–255 scale. RGB Euclidean and redmean distances are not CIELAB ΔE values and should not be compared directly with them.
+
+Selecting a new image requires loading the selected set again before masking, alignment, or analysis. Loading the set resets any generated masks and the previous report.

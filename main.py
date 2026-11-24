@@ -249,6 +249,7 @@ class MainWindow(QMainWindow):
         # The scientific workflow assumes the images are already aligned and cropped
         # before they are opened in this app.
         self.images = {key: image_data_colour(key) for key in ["B1", "B2", "A"]}
+        self.selected_image_paths = {key: "" for key in ["B1", "B2", "A"]}
         self.mask_reference_colours = {key: self.images[key].reference_colours for key in ["B1", "B2", "A"]}
         self.analysis_options = analysis_options()
         self.current_alignment_view = "B1"
@@ -460,30 +461,15 @@ class MainWindow(QMainWindow):
             self.overlay_button.setText(f" Mask overlay colour: {self.mask_overlay_colour.name()} ")
 
     def _ensure_image_loaded_for_key(self, key: str):
-        """Restore an image object from disk if the loaded state has been lost but the file path still exists."""
-        image_data = self.images[key]
-        if image_data.pixels.get("rgb") is not None:
-            return True
-
-        path = image_data.file_path
-        if not path or not Path(path).exists():
-            return False
-
-        try:
-            image_data.load_from_path(path)
-            return True
-        except Exception:
-            return False
+        """Check that the image was explicitly loaded for analysis."""
+        return self.images[key].pixels.get("rgb") is not None
 
     def _refresh_loaded_image_previews_for_key(self, key: str):
-        """Keep the load, mask, and alignment previews in sync for the selected image key."""
+        """Keep the mask and alignment previews in sync with loaded image data."""
         if not self._ensure_image_loaded_for_key(key):
             return
 
         image = self.images[key].get_pixels("rgb")
-
-        if hasattr(self, "load_preview_labels") and key in self.load_preview_labels:
-            self._preview_from_array(self.load_preview_labels[key], image)
 
         if hasattr(self, "mask_original_labels") and key in self.mask_original_labels:
             self._preview_from_array(self.mask_original_labels[key], image)
@@ -492,7 +478,7 @@ class MainWindow(QMainWindow):
             self._display_alignment_image()
 
     def _open_image_for_key(self, key: str):
-        """Open a single image and store it in the image object for the given key."""
+        """Select and preview an image without loading its analysis arrays."""
         path, _ = QFileDialog.getOpenFileName(
             self,
             f"Select {key} image",
@@ -502,24 +488,69 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        image_data = self.images[key]
-        image_data.load_from_path(path)
+        try:
+            with Image.open(path) as image:
+                image.thumbnail((800, 600))
+                rgb = image.convert("RGB")
+                data = rgb.tobytes()
+                qimage = QImage(data, rgb.width, rgb.height, rgb.width * 3, QImage.Format.Format_RGB888).copy()
+                pixmap = QPixmap.fromImage(qimage)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Image preview failed", f"Unable to preview {key}:\n{exc}")
+            return
 
-        preview_label = self.load_preview_labels[key]
-        self._preview_from_array(preview_label, image_data.get_pixels("rgb"))
+        self.selected_image_paths[key] = path
+        label = self.load_preview_labels[key]
+        label.setPixmap(pixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
         self.path_labels[key].setText(path)
         self.image_details_labels[key].setText(self._image_file_details(path))
+        self.load_images_button.setEnabled(all(self.selected_image_paths.values()))
+        self.load_status_label.setText("Selection changed. Select all three images and click Load images.")
+        for tab in (self.mask_tab, self.check_alignment_tab, self.results_tab):
+            self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
 
-        self._refresh_loaded_image_previews_for_key(key)
+    def _load_selected_images(self):
+        """Load the selected set atomically so a failed load cannot mix image sets."""
+        if not all(self.selected_image_paths.values()):
+            QMessageBox.warning(self, "Missing input", "Select B1, B2, and A before loading images.")
+            return
 
-        if hasattr(self, "_update_alignment_mode_availability"):
-            self._update_alignment_mode_availability()
+        self.load_tab.setEnabled(False)
+        self.load_status_label.setText("Loading images...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        QApplication.processEvents()
+        try:
+            loaded = {}
+            for key, path in self.selected_image_paths.items():
+                image_data = image_data_colour(key)
+                image_data.reference_colours = self.images[key].reference_colours
+                image_data.load_from_path(path)
+                loaded[key] = image_data
+        except Exception as exc:
+            self.load_status_label.setText("Loading failed. Check the selected files and try again.")
+            QMessageBox.critical(self, "Image loading failed", f"Unable to load {key}:\n{exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.load_tab.setEnabled(True)
 
-        if self.current_alignment_view == key:
-            self._display_alignment_image()
+        self.images = loaded
+        self.analysis_options.int_paper_mask = None
+        self.analysis_options.int_ink_mask = None
+        self._update_alignment_mode_availability()
+        for key in self.images:
+            self.mask_preview_labels[key].clear()
+            self.mask_preview_labels[key].setText(f"Mask {key}")
+            self._refresh_loaded_image_previews_for_key(key)
+        self._display_alignment_image()
+        self.report.clear()
+        self.status_label.setText("Images loaded. Run the analysis to create a report.")
+        self.load_status_label.setText("Images loaded.")
+        for tab in (self.mask_tab, self.check_alignment_tab, self.results_tab):
+            self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), True)
 
     def _create_load_tab(self):
-        """Tab 1: load the three images and show their file paths."""
+        """Tab 1: select, preview, and load the three images."""
         page = QWidget()
         page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         layout = QVBoxLayout(page)
@@ -551,7 +582,6 @@ class MainWindow(QMainWindow):
 
         for col, key in enumerate(["B1", "B2", "A"]):
             card = QWidget()
-            card.setFixedHeight(285)
             card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(8, 8, 8, 8)
@@ -564,7 +594,7 @@ class MainWindow(QMainWindow):
             preview_label.setStyleSheet("border: 1px solid #888; background: #262626;")
             card_layout.addWidget(preview_label)
 
-            button = QPushButton(f"Load {self.image_key_labels[key]}")
+            button = QPushButton(f"Select {self.image_key_labels[key]}")
             button.clicked.connect(lambda checked, value=key: self._open_image_for_key(value))
             button.setFixedHeight(30)
             card_layout.addWidget(button)
@@ -588,6 +618,12 @@ class MainWindow(QMainWindow):
             grid.addWidget(card, 0, col)
 
         layout.addLayout(grid)
+        self.load_images_button = QPushButton("Load images")
+        self.load_images_button.setEnabled(False)
+        self.load_images_button.clicked.connect(self._load_selected_images)
+        layout.addWidget(self.load_images_button, alignment=Qt.AlignLeft)
+        self.load_status_label = QLabel("Select all three images, then click Load images.")
+        layout.addWidget(self.load_status_label)
         return page
 
     def _get_intersection_masks_for_alignment(self):
