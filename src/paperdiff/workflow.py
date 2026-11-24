@@ -105,6 +105,26 @@ def delta_e_dict(ref_lab, new_lab):
         "ΔE CMC": float(deltaE_cmc(ref, new)),
     }
 
+
+def rgb_distance_dict(ref_rgb, new_rgb):
+    """Compare RGB means in 0..1, returning distances on the report's 0..100 scale."""
+    ref = np.asarray(ref_rgb, dtype=np.float64)
+    new = np.asarray(new_rgb, dtype=np.float64)
+    if ref.shape != (3,) or new.shape != (3,):
+        raise ValueError("ref_rgb and new_rgb must each have 3 values")
+
+    dr, dg, db = (new - ref) * 100.0
+    red_mean_8bit = (ref[0] + new[0]) * 255.0 / 2.0
+    return {
+        "RGB Euclidean": float(np.sqrt(dr ** 2 + dg ** 2 + db ** 2)),
+        "RGB redmean": float(np.sqrt(
+            (2.0 + red_mean_8bit / 256.0) * dr ** 2
+            + 4.0 * dg ** 2
+            + (2.0 + (255.0 - red_mean_8bit) / 256.0) * db ** 2
+        )),
+    }
+
+
 def _as_rgb(image: np.ndarray) -> np.ndarray:
     """Convert any image-like input to a float RGB array in the 0..1 range."""
     array = np.asarray(image, dtype=np.float32)
@@ -281,7 +301,7 @@ def upscale_smooth(avgs, height, width, dtype=np.float32):
     # Then vertically: (height, width, 3)
     return horiz[r0] * (1 - ty) + horiz[r1] * ty
 
-def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks, scale=1.0, delta_e=False):
+def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks, scale=1.0, delta_e=False, delta_e_fn=delta_e_dict):
 
     out_data = dict()
     
@@ -290,8 +310,8 @@ def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks
     ap_avg,  ap_sd  = image_avg_sd(a,a_pm)
 
     if delta_e:
-        delta_e_paper_b1 = delta_e_dict(b1p_avg,ap_avg)
-        delta_e_paper_b2 = delta_e_dict(b2p_avg,ap_avg)
+        delta_e_paper_b1 = delta_e_fn(b1p_avg,ap_avg)
+        delta_e_paper_b2 = delta_e_fn(b2p_avg,ap_avg)
         delta_e_paper_avg  = {k: (delta_e_paper_b1[k] + delta_e_paper_b2[k]) / 2.0 for k in delta_e_paper_b1}
         delta_e_paper_diff = {k: abs(delta_e_paper_b1[k] - delta_e_paper_b2[k]) for k in delta_e_paper_b1}
 
@@ -343,8 +363,8 @@ def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks
         ai_avg,  ai_sd  = image_avg_sd(a,a_im)
 
         if delta_e:
-            delta_e_ink_b1 = delta_e_dict(b1i_avg,ai_avg)
-            delta_e_ink_b2 = delta_e_dict(b2i_avg,ai_avg)
+            delta_e_ink_b1 = delta_e_fn(b1i_avg,ai_avg)
+            delta_e_ink_b2 = delta_e_fn(b2i_avg,ai_avg)
             delta_e_ink_avg  = {k: (delta_e_ink_b1[k] + delta_e_ink_b2[k]) / 2.0 for k in delta_e_ink_b1}
             delta_e_ink_diff = {k: abs(delta_e_ink_b1[k] - delta_e_ink_b2[k]) for k in delta_e_ink_b1}
 
@@ -393,7 +413,7 @@ def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks
     return out_data
 
 
-def format_data_out(raw_data, paper_diff_text, ink_diff_text, c0, c1, c2, use_masks, dec_place, delta_e):
+def format_data_out(raw_data, paper_diff_text, ink_diff_text, c0, c1, c2, use_masks, dec_place, delta_e, delta_e_heading="Perceptual Colour Difference (ΔE)"):
 
     format_out = dict()
 
@@ -446,11 +466,9 @@ def format_data_out(raw_data, paper_diff_text, ink_diff_text, c0, c1, c2, use_ma
     if delta_e:
         format_out[f"{"Paper" if use_masks else "Whole image"}"]["Change"].update(
             {
-                "Perceptual Colour Difference (ΔE)": {
-                    "ΔE76  ": f"{raw_data["paper"]["delta_e"]["avg"]["ΔE76"]:{3+dec_place}.{dec_place}f}  (±{raw_data["paper"]["delta_e"]["plus_minus"]["ΔE76"]/2.0:.{dec_place}f})",
-                    "ΔE94  ": f"{raw_data["paper"]["delta_e"]["avg"]["ΔE94"]:{3+dec_place}.{dec_place}f}  (±{raw_data["paper"]["delta_e"]["plus_minus"]["ΔE94"]/2.0:.{dec_place}f})",
-                    "ΔE2000": f"{raw_data["paper"]["delta_e"]["avg"]["ΔE2000"]:{3+dec_place}.{dec_place}f}  (±{raw_data["paper"]["delta_e"]["plus_minus"]["ΔE2000"]/2.0:.{dec_place}f})",
-                    "ΔE CMC": f"{raw_data["paper"]["delta_e"]["avg"]["ΔE CMC"]:{3+dec_place}.{dec_place}f}  (±{raw_data["paper"]["delta_e"]["plus_minus"]["ΔE CMC"]/2.0:.{dec_place}f})",
+                delta_e_heading: {
+                    name.ljust(6): f"{value:{3+dec_place}.{dec_place}f}  (±{raw_data['paper']['delta_e']['plus_minus'][name]/2.0:.{dec_place}f})"
+                    for name, value in raw_data["paper"]["delta_e"]["avg"].items()
                 }
             }
         )
@@ -506,11 +524,9 @@ def format_data_out(raw_data, paper_diff_text, ink_diff_text, c0, c1, c2, use_ma
         if delta_e:
             format_out["Ink"]["Change"].update(
                 {
-                    "Perceptual Colour Difference (ΔE)": {
-                        "ΔE76  ": f"{raw_data["ink"]["delta_e"]["avg"]["ΔE76"]:{3+dec_place}.{dec_place}f}  (±{raw_data["ink"]["delta_e"]["plus_minus"]["ΔE76"]/2.0:.{dec_place}f})",
-                        "ΔE94  ": f"{raw_data["ink"]["delta_e"]["avg"]["ΔE94"]:{3+dec_place}.{dec_place}f}  (±{raw_data["ink"]["delta_e"]["plus_minus"]["ΔE94"]/2.0:.{dec_place}f})",
-                        "ΔE2000": f"{raw_data["ink"]["delta_e"]["avg"]["ΔE2000"]:{3+dec_place}.{dec_place}f}  (±{raw_data["ink"]["delta_e"]["plus_minus"]["ΔE2000"]/2.0:.{dec_place}f})",
-                        "ΔE CMC": f"{raw_data["ink"]["delta_e"]["avg"]["ΔE CMC"]:{3+dec_place}.{dec_place}f}  (±{raw_data["ink"]["delta_e"]["plus_minus"]["ΔE CMC"]/2.0:.{dec_place}f})",
+                    delta_e_heading: {
+                        name.ljust(6): f"{value:{3+dec_place}.{dec_place}f}  (±{raw_data['ink']['delta_e']['plus_minus'][name]/2.0:.{dec_place}f})"
+                        for name, value in raw_data["ink"]["delta_e"]["avg"].items()
                     }
                 }
             )
@@ -675,7 +691,7 @@ def image_analysis_b1_b2_a(b1: image_data_colour, b2: image_data_colour, a: imag
         results[rgb_mean_heading] = {"(Scale": f"{0.0:.{dec_place}f} to {rgb_scale:.{dec_place}f})"}
 
         if op.mean_comparison:
-            raw_data_rgb = compare_b1_b2_a(rgb["b1"], rgb["b2"], rgb["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=rgb_scale, delta_e=False)
+            raw_data_rgb = compare_b1_b2_a(rgb["b1"], rgb["b2"], rgb["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=rgb_scale, delta_e=True, delta_e_fn=rgb_distance_dict)
             
             rgb_paper_diff_text = describe_rgb_change(raw_data_rgb["paper"]["change"]["avg"]/rgb_scale)
             if op.use_masks:
@@ -683,7 +699,7 @@ def image_analysis_b1_b2_a(b1: image_data_colour, b2: image_data_colour, a: imag
             else:
                 rgb_ink_diff_text = ["","",""]
 
-            results[rgb_mean_heading].update(format_data_out(raw_data_rgb,rgb_paper_diff_text,rgb_ink_diff_text,"R","G","B",op.use_masks,dec_place,False))
+            results[rgb_mean_heading].update(format_data_out(raw_data_rgb,rgb_paper_diff_text,rgb_ink_diff_text,"R","G","B",op.use_masks,dec_place,True,delta_e_heading="Colour Difference (RGB)"))
 
         # Per-pixel comparison (todo)
         if op.per_pixel_comparison:
