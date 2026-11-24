@@ -69,4 +69,8 @@ Mean-colour distances are calculated separately from B1 to A and B2 to A, then r
 
 Selecting a new image requires loading the selected set again before masking, alignment, or analysis. Loading the set resets any generated masks and the previous report.
 
+Image loading runs in the background. The Load images tab shows progress by image; **Cancel loading** stops between loading steps and preserves the previously loaded data. Individual decoding or array operations cannot be interrupted mid-step. Closing the window waits for loading to finish.
+
 Analysis runs in the background. The Analysis tab shows the current task and progress as a percentage of completed tasks; tasks may take different amounts of time. Image and analysis settings cannot be changed until it finishes. Closing the window during analysis waits for the current run to finish.
+
+Use **Cancel analysis** to stop a run. Cancellation takes effect between calculation steps, and the previous report is preserved.

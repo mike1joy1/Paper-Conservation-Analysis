@@ -9,6 +9,7 @@ import sys
 import traceback
 from copy import copy
 from pathlib import Path
+from threading import Event
 
 import numpy as np
 from PIL import Image
@@ -39,6 +40,9 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QSizePolicy,
     QSlider,
+    QStyle,
+    QStyleOptionTab,
+    QTabBar,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -51,6 +55,12 @@ from paperdiff.stats import verdict_for_region
 from paperdiff.workflow import describe_region_change, image_analysis_b1_b2_a
 
 
+CANCEL_BUTTON_STYLE = (
+    "QPushButton { background-color: #b3261e; color: white; }"
+    "QPushButton:hover:enabled { background-color: #c83d34; }"
+)
+
+
 def _as_bool_mask(mask):
     """Convert 2D or 3-channel mask arrays to a 2D bool mask."""
     if mask is None:
@@ -61,10 +71,12 @@ def _as_bool_mask(mask):
     return array.astype(bool)
 
 
-def _intersection_masks(images):
+def _intersection_masks(images, check_cancelled=None):
     mask_papers = []
     mask_inks = []
     for key in ["B1", "B2", "A"]:
+        if check_cancelled is not None:
+            check_cancelled()
         image_data = images[key]
         if image_data.pixels.get("rgb") is None:
             return None, None
@@ -79,9 +91,67 @@ def _intersection_masks(images):
         mask_papers.append(paper_mask)
         mask_inks.append(ink_mask)
 
+    if check_cancelled is not None:
+        check_cancelled()
     pm = np.logical_and.reduce(mask_papers)
+    if check_cancelled is not None:
+        check_cancelled()
     im = np.logical_and.reduce(mask_inks)
-    return np.repeat(pm[..., np.newaxis], 3, axis=-1), np.repeat(im[..., np.newaxis], 3, axis=-1)
+    pm = np.repeat(pm[..., np.newaxis], 3, axis=-1)
+    if check_cancelled is not None:
+        check_cancelled()
+    im = np.repeat(im[..., np.newaxis], 3, axis=-1)
+    return pm, im
+
+
+class AnalysisCancelled(Exception):
+    """Signal a requested cancellation from an analysis checkpoint."""
+
+
+class ImageLoadingCancelled(Exception):
+    """Signal a requested cancellation from an image-loading checkpoint."""
+
+
+class ImageLoadingThread(QThread):
+    """Load a complete image set without accessing UI widgets."""
+
+    progress = Signal(int, int, str)
+
+    def __init__(self, paths, reference_colours, parent=None):
+        super().__init__(parent)
+        self.paths = paths.copy()
+        self.reference_colours = reference_colours
+        self.cancel_requested = Event()
+        self.images = {}
+        self.previews = {}
+        self.error = None
+        self.current_key = ""
+
+    def _check_cancelled(self):
+        if self.cancel_requested.is_set():
+            raise ImageLoadingCancelled()
+
+    def run(self):
+        try:
+            for index, (key, path) in enumerate(self.paths.items(), start=1):
+                self._check_cancelled()
+                self.current_key = key
+                self.progress.emit(index, len(self.paths), key)
+                image_data = image_data_colour(key)
+                image_data.reference_colours = self.reference_colours[key]
+                image_data.load_from_path(path, check_cancelled=self._check_cancelled)
+                self._check_cancelled()
+                rgb = np.ascontiguousarray((np.clip(image_data.get_pixels("rgb"), 0.0, 1.0) * 255.0).astype(np.uint8))
+                self._check_cancelled()
+                h, w, channels = rgb.shape
+                self.previews[key] = QImage(rgb.data, w, h, w * channels, QImage.Format.Format_RGB888).copy()
+                self.images[key] = image_data
+            self._check_cancelled()
+        except ImageLoadingCancelled:
+            self.images.clear()
+            self.previews.clear()
+        except Exception:
+            self.error = traceback.format_exc()
 
 
 class AnalysisThread(QThread):
@@ -95,22 +165,35 @@ class AnalysisThread(QThread):
         self.options = copy(options)
         self.result = None
         self.error = None
+        self.cancel_requested = Event()
         self.use_intersection = self.options.images_aligned and self.options.use_masks and self.options.intersection_mask
         self.total_tasks = 1 + int(self.options.rgb_comparison) + int(self.options.lab_comparison) + int(self.use_intersection)
         self.current_task = 0
 
     def _start_task(self, description):
+        self._check_cancelled()
         self.current_task += 1
         self.progress.emit(self.current_task, self.total_tasks, description)
 
+    def _check_cancelled(self):
+        if self.cancel_requested.is_set():
+            raise AnalysisCancelled()
+
     def run(self):
         try:
+            self._check_cancelled()
             if self.use_intersection:
                 self._start_task("Calculating intersection masks")
-                self.options.int_paper_mask, self.options.int_ink_mask = _intersection_masks(self.images)
+                self.options.int_paper_mask, self.options.int_ink_mask = _intersection_masks(
+                    self.images, check_cancelled=self._check_cancelled
+                )
             self.result = image_analysis_b1_b2_a(
-                self.images["B1"], self.images["B2"], self.images["A"], self.options, progress=self._start_task
+                self.images["B1"], self.images["B2"], self.images["A"], self.options,
+                progress=self._start_task, check_cancelled=self._check_cancelled
             )
+            self._check_cancelled()
+        except AnalysisCancelled:
+            self.result = None
         except Exception:
             self.error = traceback.format_exc()
 
@@ -302,6 +385,13 @@ class ClickableLabel(ZoomableLabel):
     pass
 
 
+class AnalysisTabBar(QTabBar):
+    def initStyleOption(self, option: QStyleOptionTab, tab_index: int):
+        super().initStyleOption(option, tab_index)
+        if not self.isTabEnabled(tab_index):
+            option.state &= ~QStyle.StateFlag.State_MouseOver
+
+
 class MainWindow(QMainWindow):
     """The main window containing the analysis workflow."""
 
@@ -321,10 +411,20 @@ class MainWindow(QMainWindow):
         self.alignment_display_mode = "original"
         self.mask_overlay_colour = QColor("blue")
         self.mask_mode = "luminance"
+        self._loading_thread = None
+        self._close_after_loading = False
         self._analysis_thread = None
         self._close_after_analysis = False
 
         self.tab_widget = QTabWidget()
+        original_tab_bar = self.tab_widget.tabBar()
+        tab_bar = AnalysisTabBar()
+        tab_bar.setObjectName(original_tab_bar.objectName())
+        tab_bar.setDrawBase(original_tab_bar.drawBase())
+        self.tab_widget.setTabBar(tab_bar)
+        self.tab_widget.setStyleSheet(
+            "QTabBar::tab:disabled { color: #808080; }"
+        )
         self.setCentralWidget(self.tab_widget)
 
         self.load_tab = self._create_load_tab()
@@ -341,6 +441,9 @@ class MainWindow(QMainWindow):
         self.tab_widget.addTab(self.results_tab, "5) Results data")
         self.tab_widget.addTab(self.image_results_tab, "6) Image results")
 
+        for index in range(1, self.tab_widget.count()):
+            self.tab_widget.setTabEnabled(index, False)
+
         self._refresh_preview_box_sizes()
 
     def resizeEvent(self, event):
@@ -348,6 +451,11 @@ class MainWindow(QMainWindow):
         self._refresh_preview_box_sizes()
 
     def closeEvent(self, event):
+        if self._loading_thread is not None:
+            self._close_after_loading = True
+            self.load_status_label.setText("Loading is finishing; the window will close when it is done.")
+            event.ignore()
+            return
         if self._analysis_thread is not None:
             self._close_after_analysis = True
             self.analysis_progress_label.setText("Analysis is finishing; the window will close when it is done.")
@@ -529,19 +637,6 @@ class MainWindow(QMainWindow):
         """Check that the image was explicitly loaded for analysis."""
         return self.images[key].pixels.get("rgb") is not None
 
-    def _refresh_loaded_image_previews_for_key(self, key: str):
-        """Keep the mask and alignment previews in sync with loaded image data."""
-        if not self._ensure_image_loaded_for_key(key):
-            return
-
-        image = self.images[key].get_pixels("rgb")
-
-        if hasattr(self, "mask_original_labels") and key in self.mask_original_labels:
-            self._preview_from_array(self.mask_original_labels[key], image)
-
-        if hasattr(self, "alignment_preview") and self.current_alignment_view == key:
-            self._display_alignment_image()
-
     def _open_image_for_key(self, key: str):
         """Select and preview an image without loading its analysis arrays."""
         path, _ = QFileDialog.getOpenFileName(
@@ -571,54 +666,105 @@ class MainWindow(QMainWindow):
         self.image_details_labels[key].setText(self._image_file_details(path))
         self.load_images_button.setEnabled(all(self.selected_image_paths.values()))
         self.load_status_label.setText("Selection changed. Select all three images and click Load images.")
+        self.load_progress_bar.setValue(0)
         self.analyze_button.setEnabled(False)
         self.analysis_progress_bar.setValue(0)
         self.analysis_progress_label.setText("Load the selected images before analysis.")
-        for tab in (self.mask_tab, self.check_alignment_tab, self.results_tab, self.image_results_tab):
+        for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab, self.results_tab, self.image_results_tab):
             self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
 
     def _load_selected_images(self):
-        """Load the selected set atomically so a failed load cannot mix image sets."""
+        """Start loading the selected set without blocking the UI."""
+        if self._loading_thread is not None:
+            return
         if not all(self.selected_image_paths.values()):
             QMessageBox.warning(self, "Missing input", "Select B1, B2, and A before loading images.")
             return
 
-        self.load_tab.setEnabled(False)
+        self._loading_tab_states = {
+            index: self.tab_widget.isTabEnabled(index)
+            for index in range(1, self.tab_widget.count())
+        }
+        for index in self._loading_tab_states:
+            self.tab_widget.setTabEnabled(index, False)
+        self.load_image_type_group.setEnabled(False)
+        for button in self.load_select_buttons.values():
+            button.setEnabled(False)
+        self.load_images_button.setEnabled(False)
+        self.cancel_load_button.setEnabled(True)
+        self.cancel_load_button.setText("Cancel loading")
+        self.cancel_load_button.show()
+        self.load_progress_bar.setValue(0)
         self.load_status_label.setText("Loading images...")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        QApplication.processEvents()
-        try:
-            loaded = {}
-            for key, path in self.selected_image_paths.items():
-                image_data = image_data_colour(key)
-                image_data.reference_colours = self.images[key].reference_colours
-                image_data.load_from_path(path)
-                loaded[key] = image_data
-        except Exception as exc:
-            self.load_status_label.setText("Loading failed. Check the selected files and try again.")
-            QMessageBox.critical(self, "Image loading failed", f"Unable to load {key}:\n{exc}")
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.load_tab.setEnabled(True)
 
-        self.images = loaded
-        self.analysis_options.int_paper_mask = None
-        self.analysis_options.int_ink_mask = None
-        self._update_alignment_mode_availability()
-        for key in self.images:
-            self.mask_preview_labels[key].clear()
-            self.mask_preview_labels[key].setText(f"Mask {key}")
-            self._refresh_loaded_image_previews_for_key(key)
-        self._display_alignment_image()
-        self.report.clear()
-        self.status_label.setText("Images loaded. Run the analysis to create a report.")
-        self.load_status_label.setText("Images loaded.")
-        self.analyze_button.setEnabled(True)
-        self.analysis_progress_bar.setValue(0)
-        self.analysis_progress_label.setText("Ready to analyse.")
-        for tab in (self.mask_tab, self.check_alignment_tab, self.results_tab, self.image_results_tab):
-            self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), True)
+        reference_colours = {key: self.images[key].reference_colours for key in self.selected_image_paths}
+        self._loading_thread = ImageLoadingThread(self.selected_image_paths, reference_colours, self)
+        self._loading_thread.progress.connect(self._load_progress)
+        self._loading_thread.finished.connect(self._load_finished)
+        self._loading_thread.start()
+
+    def cancel_loading(self):
+        if self._loading_thread is None:
+            return
+        self._loading_thread.cancel_requested.set()
+        self.cancel_load_button.setEnabled(False)
+        self.cancel_load_button.setText("Cancelling...")
+        self.load_status_label.setText("Cancelling image loading...")
+
+    @Slot(int, int, str)
+    def _load_progress(self, current, total, key):
+        if self._loading_thread is not None and self._loading_thread.cancel_requested.is_set():
+            return
+        self.load_progress_bar.setValue((current - 1) * 100 // total)
+        suffix = " (closing when finished)" if self._close_after_loading else ""
+        self.load_status_label.setText(f"Loading {self.image_key_labels[key]} ({current}/{total}){suffix}")
+
+    def _load_finished(self):
+        thread = self._loading_thread
+        self._loading_thread = None
+        self.load_image_type_group.setEnabled(True)
+        for button in self.load_select_buttons.values():
+            button.setEnabled(True)
+        self.load_images_button.setEnabled(all(self.selected_image_paths.values()))
+        self.cancel_load_button.hide()
+        try:
+            if thread.error is not None:
+                self.load_status_label.setText("Loading failed. Check the selected files and try again.")
+                for index, enabled in self._loading_tab_states.items():
+                    self.tab_widget.setTabEnabled(index, enabled)
+                QMessageBox.critical(self, "Image loading failed", f"Unable to load {thread.current_key}:\n{thread.error}")
+                return
+            if thread.cancel_requested.is_set():
+                self.load_status_label.setText("Image loading cancelled.")
+                for index, enabled in self._loading_tab_states.items():
+                    self.tab_widget.setTabEnabled(index, enabled)
+                return
+
+            pixmaps = {key: QPixmap.fromImage(image) for key, image in thread.previews.items()}
+            self.images = thread.images
+            self.analysis_options.int_paper_mask = None
+            self.analysis_options.int_ink_mask = None
+            for key, pixmap in pixmaps.items():
+                self.mask_original_labels[key].setPixmap(pixmap, preserve_zoom=True)
+                self.mask_preview_labels[key].clear()
+                self.mask_preview_labels[key].setText(f"Mask {key}")
+            self._update_alignment_mode_availability()
+            self._display_alignment_image()
+            self.report.clear()
+            self.status_label.setText("Images loaded. Run the analysis to create a report.")
+            self.load_status_label.setText("Images loaded (3/3).")
+            self.load_progress_bar.setValue(100)
+            self.analyze_button.setEnabled(True)
+            self.analysis_progress_bar.setValue(0)
+            self.analysis_progress_label.setText("Ready to analyse.")
+            for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab):
+                self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), True)
+            for tab in (self.results_tab, self.image_results_tab):
+                self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
+        finally:
+            thread.deleteLater()
+            if self._close_after_loading:
+                self.close()
 
     def _create_load_tab(self):
         """Tab 1: select, preview, and load the three images."""
@@ -627,7 +773,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignTop)
 
-        input_group = QGroupBox("Image type")
+        input_group = self.load_image_type_group = QGroupBox("Image type")
         input_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         input_group.setMaximumHeight(120)
         input_group.setMaximumWidth(260)
@@ -644,6 +790,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(input_group)
 
         self.load_preview_labels = {}
+        self.load_select_buttons = {}
         self.path_labels = {}
         self.image_details_labels = {}
         self.image_key_labels = {"B1": "Before Image 1", "B2": "Before Image 2", "A": "After Image"}
@@ -684,6 +831,7 @@ class MainWindow(QMainWindow):
             card_layout.addWidget(details_label)
 
             self.load_preview_labels[key] = preview_label
+            self.load_select_buttons[key] = button
             self.path_labels[key] = path_label
             self.image_details_labels[key] = details_label
             grid.addWidget(card, 0, col)
@@ -692,8 +840,21 @@ class MainWindow(QMainWindow):
         self.load_images_button = QPushButton("Load images")
         self.load_images_button.setEnabled(False)
         self.load_images_button.clicked.connect(self._load_selected_images)
-        layout.addWidget(self.load_images_button, alignment=Qt.AlignLeft)
+        self.cancel_load_button = QPushButton("Cancel loading")
+        self.cancel_load_button.setStyleSheet(CANCEL_BUTTON_STYLE)
+        self.cancel_load_button.clicked.connect(self.cancel_loading)
+        self.cancel_load_button.hide()
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.load_images_button)
+        button_row.addWidget(self.cancel_load_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+        self.load_progress_bar = QProgressBar()
+        self.load_progress_bar.setRange(0, 100)
+        self.load_progress_bar.setValue(0)
+        layout.addWidget(self.load_progress_bar)
         self.load_status_label = QLabel("Select all three images, then click Load images.")
+        self.load_status_label.setWordWrap(True)
         layout.addWidget(self.load_status_label)
         return page
 
@@ -712,12 +873,8 @@ class MainWindow(QMainWindow):
             return
 
         mode = self.alignment_display_mode
-        if mode == "original":
-            self._preview_from_array(self.alignment_preview, image)
-            return
-
-        if not self.use_mask_checkbox.isChecked():
-            self._preview_from_array(self.alignment_preview, image)
+        if mode == "original" or not self.use_mask_checkbox.isChecked():
+            self.alignment_preview.setPixmap(self.mask_original_labels[key]._base_pixmap, preserve_zoom=True)
             return
 
         if self.alignment_checkbox.isChecked():
@@ -1139,9 +1296,9 @@ class MainWindow(QMainWindow):
 
         self.mask_threshold_slider = QSlider(Qt.Horizontal)
         self.mask_threshold_slider.setRange(0, 255)
-        self.mask_threshold_slider.setValue(140)
+        self.mask_threshold_slider.setValue(80)
         self.mask_threshold_slider.setFixedHeight(18)
-        self.mask_threshold_label = QLabel("Luminance threshold: 140")
+        self.mask_threshold_label = QLabel("Luminance threshold: 80")
         self.mask_threshold_slider.setEnabled(True)
         self.mask_threshold_slider.valueChanged.connect(
             lambda value: self.mask_threshold_label.setText(f"Luminance threshold: {value}")
@@ -1163,9 +1320,9 @@ class MainWindow(QMainWindow):
 
         self.mask_border_slider = QSlider(Qt.Horizontal)
         self.mask_border_slider.setRange(0, 20)
-        self.mask_border_slider.setValue(2)
+        self.mask_border_slider.setValue(4)
         self.mask_border_slider.setFixedHeight(18)
-        self.mask_border_label = QLabel("Mask border: 2 px")
+        self.mask_border_label = QLabel("Mask border: 4 px")
         self.mask_border_slider.valueChanged.connect(
             lambda value: self.mask_border_label.setText(f"Mask border: {value} px")
         )
@@ -1432,7 +1589,15 @@ class MainWindow(QMainWindow):
         self.analyze_button = QPushButton("Analyse")
         self.analyze_button.setFixedWidth(170)
         self.analyze_button.clicked.connect(self.analyze_images)
-        layout.addWidget(self.analyze_button, alignment=Qt.AlignLeft)
+        self.cancel_analysis_button = QPushButton("Cancel analysis")
+        self.cancel_analysis_button.setStyleSheet(CANCEL_BUTTON_STYLE)
+        self.cancel_analysis_button.clicked.connect(self.cancel_analysis)
+        self.cancel_analysis_button.hide()
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.analyze_button)
+        button_row.addWidget(self.cancel_analysis_button)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
         self.analysis_progress_bar = QProgressBar()
         self.analysis_progress_bar.setRange(0, 100)
         self.analysis_progress_bar.setValue(0)
@@ -1509,6 +1674,9 @@ class MainWindow(QMainWindow):
             self.tab_widget.setTabEnabled(index, False)
         self.analysis_settings_group.setEnabled(False)
         self.analyze_button.setEnabled(False)
+        self.cancel_analysis_button.setEnabled(True)
+        self.cancel_analysis_button.setText("Cancel analysis")
+        self.cancel_analysis_button.show()
         self.analysis_progress_label.setText("Starting analysis...")
         self.analysis_progress_bar.setValue(0)
         self.status_label.setText("Analysis in progress. The previous report remains visible until it completes.")
@@ -1518,8 +1686,18 @@ class MainWindow(QMainWindow):
         self._analysis_thread.finished.connect(self._analysis_finished)
         self._analysis_thread.start()
 
+    def cancel_analysis(self):
+        if self._analysis_thread is None:
+            return
+        self._analysis_thread.cancel_requested.set()
+        self.cancel_analysis_button.setEnabled(False)
+        self.cancel_analysis_button.setText("Cancelling...")
+        self.analysis_progress_label.setText("Cancelling analysis...")
+
     @Slot(int, int, str)
     def _analysis_progress(self, task, total, description):
+        if self._analysis_thread is not None and self._analysis_thread.cancel_requested.is_set():
+            return
         self.analysis_progress_bar.setValue((task - 1) * 100 // total)
         suffix = " (closing when finished)" if self._close_after_analysis else ""
         self.analysis_progress_label.setText(f"Task {task}/{total}: {description}{suffix}")
@@ -1529,16 +1707,23 @@ class MainWindow(QMainWindow):
         self._analysis_thread = None
         self.analysis_settings_group.setEnabled(True)
         self.analyze_button.setEnabled(True)
+        self.cancel_analysis_button.hide()
         for index, enabled in self._analysis_tab_states.items():
             self.tab_widget.setTabEnabled(index, enabled)
         try:
             if thread.error is not None:
                 raise RuntimeError(thread.error)
+            if thread.cancel_requested.is_set():
+                self.status_label.setText("Analysis cancelled. The previous report is unchanged.")
+                self.analysis_progress_label.setText("Analysis cancelled.")
+                return
             summary_lines = self.dict_to_string(thread.result, indent=" "*4, section_break="\n"+("-" * 64)+"\n")
             self.report.setPlainText(summary_lines + "\n")
             self.status_label.setText("Analysis complete. The report compares B1 against both B2 and A.")
             self.analysis_progress_label.setText(f"Analysis complete ({thread.total_tasks}/{thread.total_tasks} tasks).")
             self.analysis_progress_bar.setValue(100)
+            for tab in (self.results_tab, self.image_results_tab):
+                self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), True)
             if not self._close_after_analysis:
                 self.tab_widget.setCurrentWidget(self.results_tab)
         except Exception as exc:

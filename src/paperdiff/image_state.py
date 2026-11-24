@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import numpy as np
 from PySide6.QtGui import QColor
 from scipy.ndimage import binary_erosion
@@ -109,7 +111,7 @@ class image_data_colour:
             return np.repeat(boolean_mask.astype(np.float32), 3, axis=-1)
         return boolean_mask.astype(np.float32)
 
-    def _reset_masks_to_full(self):
+    def _reset_masks_to_full(self, check_cancelled: Callable[[], None] | None = None):
         if "rgb" in self.pixels:
             shape = np.asarray(self.pixels["rgb"]).shape[:2]
         else:
@@ -122,9 +124,17 @@ class image_data_colour:
             return
 
         full_mask = np.ones(shape, dtype=bool)
+        if check_cancelled is not None:
+            check_cancelled()
+        paper_mask = self._mask_to_rgb(full_mask)
+        if check_cancelled is not None:
+            check_cancelled()
+        ink_mask = self._mask_to_rgb(full_mask)
+        if check_cancelled is not None:
+            check_cancelled()
         self.masks = {
-            "paper": self._mask_to_rgb(full_mask),
-            "ink": self._mask_to_rgb(full_mask),
+            "paper": paper_mask,
+            "ink": ink_mask,
         }
         self.mask_border = self._mask_to_rgb(np.zeros(shape, dtype=bool))
         self.masks_exists = {"paper": False, "ink": False}
@@ -146,9 +156,13 @@ class image_data_colour:
         self.masks[name] = array
         self.masks_exists[name] = True
 
-    def load_from_path(self, path: str):
+    def load_from_path(self, path: str, check_cancelled: Callable[[], None] | None = None):
         self.file_path = path
+        if check_cancelled is not None:
+            check_cancelled()
         image = load_image(path)
+        if check_cancelled is not None:
+            check_cancelled()
         rgb = np.asarray(image, dtype=np.float32)
         if rgb.ndim == 2:
             rgb = np.repeat(rgb[..., None], 3, axis=-1)
@@ -157,11 +171,15 @@ class image_data_colour:
         if rgb.size > 0 and rgb.max() > 1.0:
             rgb = rgb / 255.0
         self.pixels["rgb"] = np.clip(rgb, 0.0, 1.0)
-        self.generate_lab_pixels()
-        self._reset_masks_to_full()
+        if check_cancelled is not None:
+            check_cancelled()
+        self.generate_lab_pixels(check_cancelled=check_cancelled)
+        self._reset_masks_to_full(check_cancelled=check_cancelled)
+        if check_cancelled is not None:
+            check_cancelled()
         return self.pixels["rgb"]
 
-    def generate_lab_pixels(self):
+    def generate_lab_pixels(self, check_cancelled: Callable[[], None] | None = None):
         if "rgb" not in self.pixels:
             return None
 
@@ -176,16 +194,22 @@ class image_data_colour:
 
         rgb = np.clip(rgb, 0.0, 1.0)
         rgb_linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+        if check_cancelled is not None:
+            check_cancelled()
         r, g, b = rgb_linear[..., 0], rgb_linear[..., 1], rgb_linear[..., 2]
         x = 0.4124 * r + 0.3576 * g + 0.1805 * b
         y = 0.2126 * r + 0.7152 * g + 0.0722 * b
         z = 0.0193 * r + 0.1192 * g + 0.9505 * b
 
+        if check_cancelled is not None:
+            check_cancelled()
         white_ref = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
         xyz = np.stack([x, y, z], axis=-1)
         xyz = xyz / white_ref
         f_xyz = np.where(xyz > 0.008856, xyz ** (1.0 / 3.0), (7.787 * xyz) + (16.0 / 116.0))
 
+        if check_cancelled is not None:
+            check_cancelled()
         l_channel = 116.0 * f_xyz[..., 1] - 16.0
         a_channel = 500.0 * (f_xyz[..., 0] - f_xyz[..., 1])
         b_channel = 200.0 * (f_xyz[..., 1] - f_xyz[..., 2])

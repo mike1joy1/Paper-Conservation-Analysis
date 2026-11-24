@@ -192,7 +192,7 @@ def image_avg(image, mask):
     else:
         return im.reshape(-1, im.shape[-1]).sum(axis=0, dtype=np.float64)/ms
 
-def image_avg_sd(image, mask):
+def image_avg_sd(image, mask, check_cancelled: Callable[[], None] | None = None):
     """
     Per-channel mean and standard deviation of `image`
     over the unmasked pixels.
@@ -208,6 +208,8 @@ def image_avg_sd(image, mask):
         SD is a measure of how uniformly the image has changed (0 = same change everywhere, e.g. treatment affect is same over whole paper)
     """
     n_ch = image.shape[-1]
+    if check_cancelled is not None:
+        check_cancelled()
     ms = np.sum(mask) / n_ch                       # number of unmasked pixels
 
     if ms == 0:
@@ -217,7 +219,11 @@ def image_avg_sd(image, mask):
     flat_m = np.asarray(mask).reshape(-1, n_ch)
 
     avg = (flat_im * flat_m).sum(axis=0, dtype=np.float64) / ms
+    if check_cancelled is not None:
+        check_cancelled()
     sq_dev = ((flat_im - avg) ** 2) * flat_m
+    if check_cancelled is not None:
+        check_cancelled()
     sd = np.sqrt(sq_dev.sum(axis=0, dtype=np.float64) / ms)
     return avg, sd
 
@@ -303,13 +309,13 @@ def upscale_smooth(avgs, height, width, dtype=np.float32):
     # Then vertically: (height, width, 3)
     return horiz[r0] * (1 - ty) + horiz[r1] * ty
 
-def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks, scale=1.0, delta_e=False, delta_e_fn=delta_e_dict):
+def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks, scale=1.0, delta_e=False, delta_e_fn=delta_e_dict, check_cancelled: Callable[[], None] | None = None):
 
     out_data = dict()
     
-    b1p_avg, b1p_sd = image_avg_sd(b1,b1_pm)
-    b2p_avg, b2p_sd = image_avg_sd(b2,b2_pm)
-    ap_avg,  ap_sd  = image_avg_sd(a,a_pm)
+    b1p_avg, b1p_sd = image_avg_sd(b1,b1_pm,check_cancelled)
+    b2p_avg, b2p_sd = image_avg_sd(b2,b2_pm,check_cancelled)
+    ap_avg,  ap_sd  = image_avg_sd(a,a_pm,check_cancelled)
 
     if delta_e:
         delta_e_paper_b1 = delta_e_fn(b1p_avg,ap_avg)
@@ -360,9 +366,9 @@ def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks
 
 
     if use_masks:
-        b1i_avg, b1i_sd = image_avg_sd(b1,b1_im)
-        b2i_avg, b2i_sd = image_avg_sd(b2,b2_im)
-        ai_avg,  ai_sd  = image_avg_sd(a,a_im)
+        b1i_avg, b1i_sd = image_avg_sd(b1,b1_im,check_cancelled)
+        b2i_avg, b2i_sd = image_avg_sd(b2,b2_im,check_cancelled)
+        ai_avg,  ai_sd  = image_avg_sd(a,a_im,check_cancelled)
 
         if delta_e:
             delta_e_ink_b1 = delta_e_fn(b1i_avg,ai_avg)
@@ -543,12 +549,16 @@ def image_analysis_b1_b2_a(
     a: image_data_colour,
     op: analysis_options,
     progress: Callable[[str], None] | None = None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> dict:
     """Compare B1 and B2 with A and return the formatted analysis data.
 
     If provided, progress is called with each task's description as it starts.
+    check_cancelled may raise to stop the analysis between expensive operations.
     """
 
+    if check_cancelled is not None:
+        check_cancelled()
     if progress is not None:
         progress("Preparing masks and image data")
 
@@ -602,10 +612,16 @@ def image_analysis_b1_b2_a(
         }
 
         for k in paper_mask:
+            if check_cancelled is not None:
+                check_cancelled()
             paper_mask[k] = np.ones_like(paper_mask[k], dtype=bool)
         for k in ink_mask:
+            if check_cancelled is not None:
+                check_cancelled()
             ink_mask[k] = np.ones_like(ink_mask[k], dtype=bool)
 
+    if check_cancelled is not None:
+        check_cancelled()
     # mask test
     total_pixels = {
         "b1": np.prod(b1.pixels.get("rgb").shape[:2]),
@@ -617,16 +633,22 @@ def image_analysis_b1_b2_a(
         "b2": np.sum(paper_mask["b2"])/3,
         "a": np.sum(paper_mask["a"])/3
     }
+    if check_cancelled is not None:
+        check_cancelled()
     ink_pixels = {
         "b1": np.sum(ink_mask["b1"])/3,
         "b2": np.sum(ink_mask["b2"])/3,
         "a": np.sum(ink_mask["a"])/3
     }
+    if check_cancelled is not None:
+        check_cancelled()
     test_union_mask = {
         "b1": np.maximum(paper_mask["b1"], ink_mask["b1"]),
         "b2": np.maximum(paper_mask["b2"], ink_mask["b2"]),
         "a": np.maximum(paper_mask["a"], ink_mask["a"])
     }
+    if check_cancelled is not None:
+        check_cancelled()
     test_intersection_mask = {
         "b1": np.minimum(paper_mask["b1"], ink_mask["b1"]),
         "b2": np.minimum(paper_mask["b2"], ink_mask["b2"]),
@@ -700,7 +722,7 @@ def image_analysis_b1_b2_a(
         results[rgb_mean_heading] = {"(Scale": f"{0.0:.{dec_place}f} to {rgb_scale:.{dec_place}f})"}
 
         if op.mean_comparison:
-            raw_data_rgb = compare_b1_b2_a(rgb["b1"], rgb["b2"], rgb["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=rgb_scale, delta_e=True, delta_e_fn=rgb_distance_dict)
+            raw_data_rgb = compare_b1_b2_a(rgb["b1"], rgb["b2"], rgb["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=rgb_scale, delta_e=True, delta_e_fn=rgb_distance_dict, check_cancelled=check_cancelled)
             
             rgb_paper_diff_text = describe_rgb_change(raw_data_rgb["paper"]["change"]["avg"]/rgb_scale)
             if op.use_masks:
@@ -781,7 +803,7 @@ def image_analysis_b1_b2_a(
 
         # mean comparison
         if op.mean_comparison:
-            raw_data_lab = compare_b1_b2_a(lab["b1"], lab["b2"], lab["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=lab_scale, delta_e=True)
+            raw_data_lab = compare_b1_b2_a(lab["b1"], lab["b2"], lab["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=lab_scale, delta_e=True, check_cancelled=check_cancelled)
             
             lab_paper_diff_text = describe_lab_change(raw_data_lab["paper"]["change"]["avg"]/lab_scale)
             if op.use_masks:
@@ -797,4 +819,6 @@ def image_analysis_b1_b2_a(
             pass
 
 
+    if check_cancelled is not None:
+        check_cancelled()
     return results
