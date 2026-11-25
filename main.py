@@ -74,10 +74,10 @@ def _as_bool_mask(mask):
 
 
 def _intersection_masks(images, check_cancelled=None):
-    """Intersect the paper and ink masks across all three images."""
+    """Intersect the paper and ink masks across the supplied images."""
     mask_papers = []
     mask_inks = []
-    for key in ["B1", "B2", "A"]:
+    for key in images:
         if check_cancelled is not None:
             check_cancelled()
         image_data = images[key]
@@ -174,16 +174,17 @@ class AnalysisThread(QThread):
 
     progress = Signal(int, int, str)
 
-    def __init__(self, images, options, parent=None):
+    def __init__(self, images, options, parent=None, mode="two_before"):
         """Snapshot analysis options and initialise worker progress and results."""
         super().__init__(parent)
         self.images = images
+        self.mode = mode
         self.options = copy(options)
         self.result = None
         self.error = None
         self.cancel_requested = Event()
-        self.use_intersection = self.options.images_aligned and self.options.use_masks and self.options.intersection_mask
-        colour_tasks = 1 + (3 * (1 + int(self.options.use_masks)) if self.options.mean_comparison else 0)
+        self.use_intersection = mode != "single" and self.options.images_aligned and self.options.use_masks and self.options.intersection_mask
+        colour_tasks = 1 + (len(images) * (1 + int(self.options.use_masks)) if self.options.mean_comparison else 0)
         self.total_tasks = (
             2 + int(self.options.show_image_data) + int(self.use_intersection)
             + colour_tasks * (int(self.options.rgb_comparison) + int(self.options.lab_comparison))
@@ -211,8 +212,8 @@ class AnalysisThread(QThread):
                     self.images, check_cancelled=self._check_cancelled
                 )
             self.result = image_analysis_b1_b2_a(
-                self.images["B1"], self.images["B2"], self.images["A"], self.options,
-                progress=self._start_task, check_cancelled=self._check_cancelled
+                self.images["B1"], self.images.get("B2"), self.images.get("A"), self.options,
+                progress=self._start_task, check_cancelled=self._check_cancelled, mode=self.mode
             )
             self._check_cancelled()
         except AnalysisCancelled:
@@ -437,6 +438,7 @@ class MainWindow(QMainWindow):
         # before they are opened in this app.
         self.images = {key: image_data_colour(key) for key in ["B1", "B2", "A"]}
         self.selected_image_paths = {key: "" for key in ["B1", "B2", "A"]}
+        self.image_mode = "two_before"
         self.mask_reference_colours = {key: self.images[key].reference_colours for key in ["B1", "B2", "A"]}
         self.analysis_options = analysis_options()
         self.current_alignment_view = "B1"
@@ -476,7 +478,7 @@ class MainWindow(QMainWindow):
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         self._base_tab_tooltips = dict((
-            (self.load_tab, "Select, preview, and load the before and after images."),
+            (self.load_tab, "Select, preview, and load images."),
             (self.mask_tab, "Generate paper and ink masks."),
             (self.check_alignment_tab, "Inspect image alignment."),
             (self.analysis_options_tab, "Configure and run analysis."),
@@ -489,6 +491,8 @@ class MainWindow(QMainWindow):
         for index in range(1, self.tab_widget.count()):
             self.tab_widget.setTabEnabled(index, False)
 
+        for mode, button in self.image_mode_buttons.items():
+            button.toggled.connect(lambda checked, value=mode: self._set_image_mode(value) if checked else None)
         self._base_control_tooltips = {
             widget: widget.toolTip()
             for tab in self._base_tab_tooltips
@@ -521,12 +525,27 @@ class MainWindow(QMainWindow):
         if self._analysis_thread is not None:
             return "analysis is in progress"
 
+        for key in ("B2", "A"):
+            if key not in self._active_image_keys() and (
+                widget is self.alignment_buttons[key]
+                or any(card is widget or card.isAncestorOf(widget)
+                       for card in (self.load_image_cards[key], self.mask_image_cards[key]))
+            ):
+                return ("only one image is selected" if self.image_mode == "single"
+                        else "only one before and one after image are selected")
+
         for tab in self._base_tab_tooltips:
             if tab.isAncestorOf(widget) and not self.tab_widget.isTabEnabled(self.tab_widget.indexOf(tab)):
                 return self._disabled_tab_reason(tab)
 
         if widget is self.load_images_button:
-            return "select all three images first"
+            if self.image_mode == "single":
+                return "select an image first"
+            return "select all three images first" if self.image_mode != "one_each" else "select both images first"
+        if self.image_mode == "single" and widget in (
+            self.alignment_checkbox, self.intersection_mask_checkbox, self.per_pixel_comparison_checkbox
+        ):
+            return "comparison requires at least two images"
         if widget is self.alignment_checkbox:
             return "images must have the same resolution"
         if (self.mask_tab.isAncestorOf(widget) or widget is self.use_masks_checkbox) and not self.use_mask_checkbox.isChecked():
@@ -595,7 +614,7 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "load_preview_labels"):
             for label in self.load_preview_labels.values():
-                label.setMinimumSize(80, 60)
+                label.setMinimumWidth(80)
 
         if hasattr(self, "alignment_preview"):
             self.alignment_preview.setMinimumSize(200, 120)
@@ -604,7 +623,7 @@ class MainWindow(QMainWindow):
             for label in self.mask_original_labels.values():
                 label.setMinimumSize(80, 60)
                 label.setFixedHeight(thumb_height)
-                if hasattr(label, "_apply_fit_zoom"):
+                if not label._base_pixmap.isNull():
                     label._apply_fit_zoom()
                     label._refresh_zoomed_pixmap()
             for label in self.mask_preview_labels.values():
@@ -756,11 +775,131 @@ class MainWindow(QMainWindow):
         """Check that the image was explicitly loaded for analysis."""
         return self.images[key].pixels.get("rgb") is not None
 
+    def _active_image_keys(self):
+        """Return the image slots required by the selected configuration."""
+        if self.image_mode == "single":
+            return ("B1",)
+        return ("B1", "A") if self.image_mode == "one_each" else ("B1", "B2", "A")
+
+    def _set_image_mode(self, mode):
+        """Update slot labels and invalidate loaded data when the configuration changes."""
+        if mode == self.image_mode:
+            return
+        previous_mode = self.image_mode
+        if mode == "single":
+            self._saved_after_preview = QPixmap(self.load_preview_labels["A"].pixmap())
+            self.load_preview_labels["A"].setText("No image")
+            self.path_labels["A"].setText("Not used")
+            self.image_details_labels["A"].setText("No image details")
+        elif previous_mode == "single":
+            path = self.selected_image_paths["A"]
+            if path:
+                self.load_preview_labels["A"].setPixmap(self._saved_after_preview)
+                self.path_labels["A"].setText(path)
+                self.image_details_labels["A"].setText(self._image_file_details(path))
+            else:
+                self.path_labels["A"].setText("No file selected")
+        self.image_mode = mode
+        self.selected_image_paths["B2"] = ""
+        self.path_labels["B2"].setText("No file selected")
+        self.image_details_labels["B2"].setText("No image details")
+        self.load_preview_labels["B2"].clear()
+        self.image_key_labels = {
+            "single": {"B1": "Image", "B2": "the middle image", "A": "the after image"},
+            "two_before": {"B1": "Before Image 1", "B2": "Before Image 2", "A": "After Image"},
+            "one_each": {"B1": "Before Image", "B2": "the middle image", "A": "After Image"},
+            "two_after": {"B1": "Before Image", "B2": "After Image 1", "A": "After Image 2"},
+        }[mode]
+        short_labels = {
+            "single": {"B1": "Image", "B2": "No image", "A": "No image"},
+            "two_before": {"B1": "B1", "B2": "B2", "A": "A"},
+            "one_each": {"B1": "B", "B2": "No image", "A": "A"},
+            "two_after": {"B1": "B", "B2": "A1", "A": "A2"},
+        }[mode]
+        for key in ("B1", "B2", "A"):
+            label, short = self.image_key_labels[key], short_labels[key]
+            active = key in self._active_image_keys()
+            button = self.load_select_buttons[key]
+            button.setText(f"Select {label}" if active else "No image")
+            self._base_control_tooltips[button] = f"Select and preview {label}; load the selected images afterwards."
+            if not active or not self.selected_image_paths[key]:
+                self.load_preview_labels[key].setText(label if active else "No image")
+            self.alignment_buttons[key].setText(short)
+            self._base_control_tooltips[self.alignment_buttons[key]] = f"Show {label} in the alignment preview."
+            self.mask_generate_buttons[key].setText(f"Generate mask for {short}" if active else "Generate mask")
+            self.mask_remove_buttons[key].setText(f"Remove mask for {short}" if active else "Remove mask")
+            for widget, tooltip in (
+                (self.paper_colour_buttons[key], f"Choose the paper reference colour for {label}."),
+                (self.ink_colour_buttons[key], f"Choose the ink reference colour for {label}."),
+                (self.mask_generate_buttons[key], f"Generate paper and ink masks for {label} using the current settings."),
+                (self.mask_remove_buttons[key], f"Remove the generated masks for {label}."),
+                (self.mask_import_buttons[key], f"Import a colour mask for {label}."),
+                (self.mask_export_buttons[key], f"Export the mask for {label} as a PNG image."),
+                (self.mask_export_path_buttons[key], f"Choose the mask export folder and filename for {label}."),
+                (self.mask_export_path_fields[key], f"Current mask export path for {label}."),
+            ):
+                self._base_control_tooltips[widget] = tooltip
+            self.load_image_cards[key].setEnabled(active)
+            self.mask_image_cards[key].setEnabled(active)
+            self.alignment_buttons[key].setEnabled(active)
+            if key != "B2" and active:
+                if self.mask_original_labels[key]._base_pixmap.isNull():
+                    self.mask_original_labels[key].setText(f"Original {short}")
+                if self.mask_preview_labels[key].pixmap().isNull():
+                    self.mask_preview_labels[key].setText(f"Mask {short}")
+            elif key != "B2":
+                self.mask_original_labels[key].clear()
+                self.mask_original_labels[key].setText("No image")
+                self.mask_preview_labels[key].clear()
+                self.mask_preview_labels[key].setText("No image")
+        self.mask_original_labels["B2"].clear()
+        self.mask_preview_labels["B2"].clear()
+        if mode in ("one_each", "single"):
+            self.mask_original_labels["B2"].setText("No image")
+            self.mask_preview_labels["B2"].setText("No image")
+        else:
+            short = short_labels["B2"]
+            self.mask_original_labels["B2"].setText(f"Original {short}")
+            self.mask_preview_labels["B2"].setText(f"Mask {short}")
+        if mode == "single":
+            self.alignment_checkbox.setChecked(False)
+            self.alignment_checkbox.setEnabled(False)
+        self.image_configuration_group.setTitle("Images to analyse" if mode == "single" else "Images to compare")
+        self.analysis_settings_group.setTitle("Analysis settings" if mode == "single" else "Comparison settings")
+        for widget, single_text, comparison_text, single_tip, comparison_tip in (
+            (self.rgb_comparison_checkbox, "RGB analysis", "RGB comparison",
+             "Include RGB colour statistics in the results.", "Include RGB colour comparisons in the results."),
+            (self.lab_comparison_checkbox, "LAB analysis", "LAB comparison",
+             "Include CIELAB colour statistics in the results.", "Include CIELAB colour comparisons in the results."),
+            (self.mean_comparison_checkbox, "Mean colour statistics", "Mean comparison",
+             "Report average colours and their standard deviations.", "Compare average colours and report their differences."),
+        ):
+            widget.setText(single_text if mode == "single" else comparison_text)
+            self._base_control_tooltips[widget] = single_tip if mode == "single" else comparison_tip
+        self._base_control_tooltips[self.use_masks_checkbox] = (
+            "Analyse paper and ink separately using their masks. Enable Use mask on the Mask tab first."
+            if mode == "single" else
+            "Compare paper and ink separately using their masks. Enable Use mask on the Mask tab first."
+        )
+        self._refresh_analysis_options_state()
+        self.current_alignment_view = "B1"
+        self._update_alignment_buttons()
+        self.load_images_button.setEnabled(all(self.selected_image_paths[key] for key in self._active_image_keys()))
+        self.load_status_label.setText("Image configuration changed. Select the required images and click Load images.")
+        self.load_progress_bar.setValue(0)
+        self.analyze_button.setEnabled(False)
+        self.analysis_progress_bar.setValue(0)
+        self.analysis_progress_label.setText("Load the selected images before analysis.")
+        self.report.clear()
+        for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab, self.results_tab, self.image_results_tab):
+            self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
+        self._refresh_disabled_tooltips()
+
     def _open_image_for_key(self, key: str):
         """Select and preview an image without loading its analysis arrays."""
         path, _ = QFileDialog.getOpenFileName(
             self,
-            f"Select {key} image",
+            f"Select {self.image_key_labels[key]}",
             "",
             "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
         )
@@ -775,7 +914,7 @@ class MainWindow(QMainWindow):
                 qimage = QImage(data, rgb.width, rgb.height, rgb.width * 3, QImage.Format.Format_RGB888).copy()
                 pixmap = QPixmap.fromImage(qimage)
         except (OSError, ValueError) as exc:
-            QMessageBox.critical(self, "Image preview failed", f"Unable to preview {key}:\n{exc}")
+            QMessageBox.critical(self, "Image preview failed", f"Unable to preview {self.image_key_labels[key]}:\n{exc}")
             return
 
         self.selected_image_paths[key] = path
@@ -783,8 +922,8 @@ class MainWindow(QMainWindow):
         label.setPixmap(pixmap.scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
         self.path_labels[key].setText(path)
         self.image_details_labels[key].setText(self._image_file_details(path))
-        self.load_images_button.setEnabled(all(self.selected_image_paths.values()))
-        self.load_status_label.setText("Selection changed. Select all three images and click Load images.")
+        self.load_images_button.setEnabled(all(self.selected_image_paths[k] for k in self._active_image_keys()))
+        self.load_status_label.setText("Selection changed. Select the required images and click Load images.")
         self.load_progress_bar.setValue(0)
         self.analyze_button.setEnabled(False)
         self.analysis_progress_bar.setValue(0)
@@ -793,21 +932,45 @@ class MainWindow(QMainWindow):
             self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
         self._refresh_disabled_tooltips()
 
+    def _reset_loaded_data(self):
+        """Clear loaded images, masks, previews, and results while retaining image selections."""
+        self.images = {key: image_data_colour(key) for key in self.selected_image_paths}
+        self.analysis_options.int_paper_mask = None
+        self.analysis_options.int_ink_mask = None
+        for key, image in self.images.items():
+            image.reference_colours = self.mask_reference_colours[key]
+            active = key in self._active_image_keys()
+            self.mask_original_labels[key].clear()
+            self.mask_original_labels[key].setText(
+                f"Original {self.alignment_buttons[key].text()}" if active else "No image"
+            )
+            self.mask_preview_labels[key].clear()
+            self.mask_preview_labels[key].setText(
+                f"Mask {self.alignment_buttons[key].text()}" if active else "No image"
+            )
+            self.mask_export_paths[key] = ""
+            self.mask_export_path_fields[key].clear()
+        self.alignment_preview.clear()
+        self.alignment_preview.setText(f"{self.image_key_labels[self.current_alignment_view]} not loaded")
+        self.report.clear()
+        self.status_label.setText("Load the selected images for analysis.")
+        self.analyze_button.setEnabled(False)
+        self.analysis_progress_bar.setValue(0)
+        self.analysis_progress_label.setText("Load the selected images before analysis.")
+
     def _load_selected_images(self):
         """Start loading the selected set without blocking the UI."""
         if self._loading_thread is not None:
             return
-        if not all(self.selected_image_paths.values()):
-            QMessageBox.warning(self, "Missing input", "Select B1, B2, and A before loading images.")
+        if not all(self.selected_image_paths[key] for key in self._active_image_keys()):
+            QMessageBox.warning(self, "Missing input", "Select all required images before loading.")
             return
 
-        self._loading_tab_states = {
-            index: self.tab_widget.isTabEnabled(index)
-            for index in range(1, self.tab_widget.count())
-        }
-        for index in self._loading_tab_states:
+        self._reset_loaded_data()
+        for index in range(1, self.tab_widget.count()):
             self.tab_widget.setTabEnabled(index, False)
         self.load_image_type_group.setEnabled(False)
+        self.image_configuration_group.setEnabled(False)
         for button in self.load_select_buttons.values():
             button.setEnabled(False)
         self.load_images_button.setEnabled(False)
@@ -817,8 +980,9 @@ class MainWindow(QMainWindow):
         self.load_progress_bar.setValue(0)
         self.load_status_label.setText("Loading images...")
 
-        reference_colours = {key: self.images[key].reference_colours for key in self.selected_image_paths}
-        self._loading_thread = ImageLoadingThread(self.selected_image_paths, reference_colours, self)
+        paths = {key: self.selected_image_paths[key] for key in self._active_image_keys()}
+        reference_colours = {key: self.images[key].reference_colours for key in paths}
+        self._loading_thread = ImageLoadingThread(paths, reference_colours, self)
         self._loading_thread.progress.connect(self._load_progress)
         self._loading_thread.finished.connect(self._load_finished)
         self._loading_thread.start()
@@ -848,42 +1012,37 @@ class MainWindow(QMainWindow):
         thread = self._loading_thread
         self._loading_thread = None
         self.load_image_type_group.setEnabled(True)
+        self.image_configuration_group.setEnabled(True)
         for button in self.load_select_buttons.values():
             button.setEnabled(True)
-        self.load_images_button.setEnabled(all(self.selected_image_paths.values()))
+        self.load_images_button.setEnabled(all(self.selected_image_paths[key] for key in self._active_image_keys()))
         self.cancel_load_button.hide()
         try:
             if thread.error is not None:
                 self.load_status_label.setText("Loading failed. Check the selected files and try again.")
-                for index, enabled in self._loading_tab_states.items():
-                    self.tab_widget.setTabEnabled(index, enabled)
-                QMessageBox.critical(self, "Image loading failed", f"Unable to load {thread.current_key}:\n{thread.error}")
+                label = self.alignment_buttons[thread.current_key].text()
+                QMessageBox.critical(self, "Image loading failed", f"Unable to load {label}:\n{thread.error}")
                 return
             if thread.cancel_requested.is_set():
                 self.load_status_label.setText("Image loading cancelled.")
-                for index, enabled in self._loading_tab_states.items():
-                    self.tab_widget.setTabEnabled(index, enabled)
                 return
 
             pixmaps = {key: QPixmap.fromImage(image) for key, image in thread.previews.items()}
-            previous_paths = {key: image.file_path for key, image in self.images.items()}
-            self.images = thread.images
-            self.analysis_options.int_paper_mask = None
-            self.analysis_options.int_ink_mask = None
+            self.images.update(thread.images)
             for key, pixmap in pixmaps.items():
                 self.mask_original_labels[key].setPixmap(pixmap, preserve_zoom=True)
                 self.mask_preview_labels[key].clear()
-                self.mask_preview_labels[key].setText(f"Mask {key}")
+                self.mask_preview_labels[key].setText(f"Mask {self.alignment_buttons[key].text()}")
                 image_path = Path(self.images[key].file_path)
-                if previous_paths[key] != str(image_path) or not self.mask_export_paths[key]:
-                    self.mask_export_paths[key] = str(image_path.with_name(f"{image_path.stem}_mask.png"))
+                self.mask_export_paths[key] = str(image_path.with_name(f"{image_path.stem}_mask.png"))
                 self.mask_export_path_fields[key].setText(self.mask_export_paths[key])
             self._update_mask_file_controls()
             self._update_alignment_mode_availability()
             self._display_alignment_image()
             self.report.clear()
             self.status_label.setText("Images loaded. Run the analysis to create a report.")
-            self.load_status_label.setText("Images loaded (3/3).")
+            count = len(self._active_image_keys())
+            self.load_status_label.setText(f"Images loaded ({count}/{count}).")
             self.load_progress_bar.setValue(100)
             self.analyze_button.setEnabled(True)
             self.analysis_progress_bar.setValue(0)
@@ -899,11 +1058,32 @@ class MainWindow(QMainWindow):
                 self.close()
 
     def _create_load_tab(self):
-        """Tab 1: select, preview, and load the three images."""
+        """Tab 1: select, preview, and load the configured images."""
         page = QWidget()
         page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignTop)
+
+        self.image_configuration_group = QGroupBox("Images to compare")
+        self.image_configuration_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        configuration_layout = QHBoxLayout(self.image_configuration_group)
+        configuration_layout.setSpacing(18)
+        self.image_configuration_buttons = QButtonGroup(page)
+        self.image_mode_buttons = {}
+        for mode, text in (
+            ("single", "1 image"),
+            ("one_each", "1 before, 1 after"),
+            ("two_before", "2 before, 1 after"),
+            ("two_after", "1 before, 2 after"),
+        ):
+            button = QRadioButton(text)
+            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            button.setToolTip("Analyse one image." if mode == "single" else f"Compare {text}.")
+            self.image_configuration_buttons.addButton(button)
+            configuration_layout.addWidget(button)
+            self.image_mode_buttons[mode] = button
+        self.image_mode_buttons["two_before"].setChecked(True)
+        layout.addWidget(self.image_configuration_group)
 
         input_group = self.load_image_type_group = QGroupBox("Image type")
         input_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -927,6 +1107,7 @@ class MainWindow(QMainWindow):
         self.load_select_buttons = {}
         self.path_labels = {}
         self.image_details_labels = {}
+        self.load_image_cards = {}
         self.image_key_labels = {"B1": "Before Image 1", "B2": "Before Image 2", "A": "After Image"}
         grid = QGridLayout()
         grid.setHorizontalSpacing(14)
@@ -934,7 +1115,7 @@ class MainWindow(QMainWindow):
 
         for col, key in enumerate(["B1", "B2", "A"]):
             card = QWidget()
-            card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            card.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(8, 8, 8, 8)
             card_layout.setSpacing(6)
@@ -942,7 +1123,7 @@ class MainWindow(QMainWindow):
             preview_label = QLabel(self.image_key_labels[key])
             preview_label.setAlignment(Qt.AlignCenter)
             preview_label.setFixedHeight(300)
-            preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            preview_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             preview_label.setStyleSheet("border: 1px solid #888; background: #262626;")
             card_layout.addWidget(preview_label)
 
@@ -969,15 +1150,17 @@ class MainWindow(QMainWindow):
             self.load_select_buttons[key] = button
             self.path_labels[key] = path_label
             self.image_details_labels[key] = details_label
+            self.load_image_cards[key] = card
             grid.addWidget(card, 0, col)
+            grid.setColumnStretch(col, 1)
 
         layout.addLayout(grid)
         self.load_images_button = QPushButton("Load images")
-        self.load_images_button.setToolTip("Load and prepare all three selected images for analysis.")
+        self.load_images_button.setToolTip("Load and prepare the selected images for analysis.")
         self.load_images_button.setEnabled(False)
         self.load_images_button.clicked.connect(self._load_selected_images)
         self.cancel_load_button = QPushButton("Cancel loading")
-        self.cancel_load_button.setToolTip("Cancel loading between processing steps and keep the previously loaded data.")
+        self.cancel_load_button.setToolTip("Cancel loading between processing steps; selected image paths are retained.")
         self.cancel_load_button.setStyleSheet(CANCEL_BUTTON_STYLE)
         self.cancel_load_button.clicked.connect(self.cancel_loading)
         self.cancel_load_button.hide()
@@ -997,15 +1180,15 @@ class MainWindow(QMainWindow):
 
     def _get_intersection_masks_for_alignment(self):
         """Return the intersection paper and ink masks across all loaded images when alignment mode is enabled."""
-        return _intersection_masks(self.images)
+        return _intersection_masks({key: self.images[key] for key in self._active_image_keys()})
 
     def _display_alignment_image(self):
-        """Show one of the three images in the alignment check area."""
+        """Show the selected image in the alignment check area."""
         key = self.current_alignment_view
         image_data = self.images[key]
         image = image_data.get_pixels("rgb") if image_data.pixels.get("rgb") is not None else None
         if image is None:
-            self.alignment_preview.setText(f"{key} not loaded")
+            self.alignment_preview.setText(f"{self.image_key_labels[key]} not loaded")
             self.alignment_preview.setPixmap(QPixmap())
             return
 
@@ -1016,8 +1199,6 @@ class MainWindow(QMainWindow):
 
         if self.alignment_checkbox.isChecked():
             paper_mask, ink_mask = self._get_intersection_masks_for_alignment()
-            self.analysis_options.int_paper_mask = paper_mask
-            self.analysis_options.int_ink_mask = ink_mask
             if paper_mask is None or ink_mask is None:
                 self._preview_from_array(self.alignment_preview, image)
                 return
@@ -1067,7 +1248,7 @@ class MainWindow(QMainWindow):
 
     def _cycle_alignment_image(self):
         """Advance the alignment preview to the next image."""
-        order = ["B1", "B2", "A"]
+        order = self._active_image_keys()
         current_index = order.index(self.current_alignment_view)
         self.current_alignment_view = order[(current_index + 1) % len(order)]
         self._update_alignment_buttons()
@@ -1076,7 +1257,7 @@ class MainWindow(QMainWindow):
     def _images_have_identical_resolution(self):
         """Check whether all loaded images have matching dimensions."""
         sizes = []
-        for key in ["B1", "B2", "A"]:
+        for key in self._active_image_keys():
             image_data = self.images[key]
             image = image_data.pixels.get("rgb")
             if image is None:
@@ -1092,7 +1273,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "alignment_checkbox"):
             return
 
-        available = self._images_have_identical_resolution()
+        available = self.image_mode != "single" and self._images_have_identical_resolution()
         self.alignment_checkbox.setEnabled(available)
         if not available:
             self.alignment_checkbox.setChecked(False)
@@ -1116,7 +1297,7 @@ class MainWindow(QMainWindow):
             self._reset_alignment_zoom()
 
     def _create_check_alignment_tab(self):
-        """Create the tab for visually inspecting alignment across B1, B2, and A."""
+        """Create the tab for visually inspecting alignment between images."""
         page = QWidget()
         page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         layout = QVBoxLayout(page)
@@ -1125,7 +1306,7 @@ class MainWindow(QMainWindow):
         self.alignment_checkbox = QCheckBox("Aligned image mode")
         self.alignment_checkbox.setToolTip(
             "Treat the images as already aligned and preview their shared mask areas. "
-            "All three images must have the same resolution."
+            "All selected images must have the same resolution."
         )
         self.alignment_checkbox.setChecked(False)
         self.alignment_checkbox.setEnabled(False)
@@ -1215,6 +1396,8 @@ class MainWindow(QMainWindow):
 
     def _set_alignment_view(self, key: str):
         """Select an image for the alignment preview."""
+        if key not in self._active_image_keys():
+            return
         self.current_alignment_view = key
         self._update_alignment_buttons()
         self._display_alignment_image()
@@ -1282,7 +1465,7 @@ class MainWindow(QMainWindow):
     def _set_mask_reference_colour(self, key: str, region: str):
         """Choose a paper or ink reference colour for one image."""
         image_data = self.images[key]
-        colour = QColorDialog.getColor(image_data.reference_colours[region], self, f"Select {region} colour for {key}")
+        colour = QColorDialog.getColor(image_data.reference_colours[region], self, f"Select {region} colour for {self.image_key_labels[key]}")
         if not colour.isValid():
             return
 
@@ -1297,7 +1480,7 @@ class MainWindow(QMainWindow):
         if not colour.isValid():
             return
 
-        for key in ["B1", "B2", "A"]:
+        for key in self._active_image_keys():
             self.images[key].reference_colours[region] = colour
             self.mask_reference_colours[key] = self.images[key].reference_colours
 
@@ -1323,7 +1506,7 @@ class MainWindow(QMainWindow):
     def _generate_mask_for_key(self, key: str):
         """Create separate paper and ink masks and keep the red border out of both."""
         if not self._ensure_image_loaded_for_key(key):
-            QMessageBox.warning(self, "Missing image", f"Load {key} before generating a mask.")
+            QMessageBox.warning(self, "Missing image", f"Load {self.image_key_labels[key]} before generating a mask.")
             return
 
         image_data = self.images[key]
@@ -1350,7 +1533,7 @@ class MainWindow(QMainWindow):
 
     def _generate_mask_for_all(self):
         """Generate masks for all images currently loaded into the app."""
-        for key in ["B1", "B2", "A"]:
+        for key in self._active_image_keys():
             if self.images[key].pixels.get("rgb") is not None:
                 self._generate_mask_for_key(key)
 
@@ -1361,7 +1544,7 @@ class MainWindow(QMainWindow):
 
         if key in self.mask_preview_labels:
             self.mask_preview_labels[key].clear()
-            self.mask_preview_labels[key].setText(f"Mask {key}")
+            self.mask_preview_labels[key].setText(f"Mask {self.alignment_buttons[key].text()}")
 
         self._update_mask_file_controls()
         self._display_alignment_image()
@@ -1370,10 +1553,10 @@ class MainWindow(QMainWindow):
         """Prompt for a mask file and import it for the selected image."""
         image_data = self.images[key]
         if not self._ensure_image_loaded_for_key(key):
-            QMessageBox.warning(self, "Missing image", f"Load {key} before importing a mask.")
+            QMessageBox.warning(self, "Missing image", f"Load {self.image_key_labels[key]} before importing a mask.")
             return
         path, _ = QFileDialog.getOpenFileName(
-            self, f"Import mask for {key}", str(Path(image_data.file_path).parent),
+            self, f"Import mask for {self.image_key_labels[key]}", str(Path(image_data.file_path).parent),
             "Images (*.png *.bmp *.tif *.tiff *.jpg *.jpeg)",
         )
         if not path:
@@ -1381,7 +1564,7 @@ class MainWindow(QMainWindow):
         try:
             self._import_mask_from_path(key, path)
         except (OSError, ValueError, Image.DecompressionBombError) as exc:
-            QMessageBox.critical(self, "Mask import failed", f"Unable to import the mask for {key}:\n{exc}")
+            QMessageBox.critical(self, "Mask import failed", f"Unable to import the mask for {self.alignment_buttons[key].text()}:\n{exc}")
 
     def _import_mask_from_path(self, key: str, path: str):
         """Load a mask from a path and refresh the affected previews."""
@@ -1400,18 +1583,20 @@ class MainWindow(QMainWindow):
         imported = []
         missing = []
         errors = []
-        for key, path in self.mask_export_paths.items():
+        for key in self._active_image_keys():
+            path = self.mask_export_paths[key]
+            label = self.alignment_buttons[key].text()
             if not path:
-                errors.append(f"{key}: no export path is set")
+                errors.append(f"{label}: no export path is set")
             else:
                 try:
                     self._import_mask_from_path(key, path)
                 except FileNotFoundError:
-                    missing.append(key)
+                    missing.append(label)
                 except (OSError, ValueError, Image.DecompressionBombError) as exc:
-                    errors.append(f"{key} ({path}): {exc}")
+                    errors.append(f"{label} ({path}): {exc}")
                 else:
-                    imported.append(key)
+                    imported.append(label)
 
         details = [f"Imported: {', '.join(imported) if imported else 'none'}."]
         if missing:
@@ -1425,7 +1610,7 @@ class MainWindow(QMainWindow):
     def _set_mask_export_path_for_key(self, key: str):
         """Choose and validate the PNG export destination for one image."""
         path, _ = QFileDialog.getSaveFileName(
-            self, f"Set mask export path for {key}", self.mask_export_paths[key],
+            self, f"Set mask export path for {self.image_key_labels[key]}", self.mask_export_paths[key],
             "PNG images (*.png)", options=QFileDialog.Option.DontConfirmOverwrite,
         )
         if not path:
@@ -1442,7 +1627,7 @@ class MainWindow(QMainWindow):
         """Export one mask after confirming replacement of an existing file."""
         path = self.mask_export_paths[key]
         if not path:
-            QMessageBox.warning(self, "Missing export path", f"Load {key} before exporting a mask.")
+            QMessageBox.warning(self, "Missing export path", f"Load {self.image_key_labels[key]} before exporting a mask.")
             return False
         if Path(path).exists() and QMessageBox.question(
             self, "Overwrite mask?", f"{path} already exists. Replace it?",
@@ -1452,7 +1637,7 @@ class MainWindow(QMainWindow):
         try:
             self.images[key].export_mask(path)
         except (OSError, ValueError) as exc:
-            QMessageBox.critical(self, "Mask export failed", f"Unable to export the mask for {key}:\n{exc}")
+            QMessageBox.critical(self, "Mask export failed", f"Unable to export the mask for {self.alignment_buttons[key].text()}:\n{exc}")
             return False
         if notify:
             QMessageBox.information(self, "Mask exported", f"Mask saved to:\n{path}")
@@ -1460,17 +1645,18 @@ class MainWindow(QMainWindow):
 
     def _export_all_masks(self):
         """Export masks to distinct configured paths and summarise the outcomes."""
-        paths = [os.path.normcase(os.path.realpath(path)) for path in self.mask_export_paths.values() if path]
+        paths = [os.path.normcase(os.path.realpath(self.mask_export_paths[key]))
+                 for key in self._active_image_keys() if self.mask_export_paths[key]]
         if len(set(paths)) != len(paths):
             QMessageBox.warning(self, "Mask export failed", "Choose a different export path for each image.")
             return
         exported = []
         skipped = []
-        for key in self.mask_export_paths:
+        for key in self._active_image_keys():
             if self._export_mask_for_key(key, notify=False):
-                exported.append(key)
+                exported.append(self.alignment_buttons[key].text())
             else:
-                skipped.append(key)
+                skipped.append(self.alignment_buttons[key].text())
         details = [f"Exported: {', '.join(exported) if exported else 'none'}."]
         if skipped:
             details.append(f"Skipped or failed: {', '.join(skipped)}.")
@@ -1655,6 +1841,7 @@ class MainWindow(QMainWindow):
         self.mask_export_path_buttons = {}
         self.mask_export_path_fields = {}
         self.mask_export_paths = {}
+        self.mask_image_cards = {}
         grid = QGridLayout()
         grid.setAlignment(Qt.AlignTop)
         grid.setHorizontalSpacing(8)
@@ -1737,21 +1924,22 @@ class MainWindow(QMainWindow):
             self.mask_export_path_buttons[key] = export_path_button
             self.mask_export_path_fields[key] = export_path_field
             self.mask_export_paths[key] = ""
+            self.mask_image_cards[key] = card
             grid.addWidget(card, 0, col)
 
         self.change_all_paper_button = QPushButton("Set all paper colours")
-        self.change_all_paper_button.setToolTip("Set the same paper reference colour for all three images.")
+        self.change_all_paper_button.setToolTip("Set the same paper reference colour for all selected images.")
         self.change_all_paper_button.setMinimumWidth(180)
         self.change_all_paper_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.change_all_paper_button.clicked.connect(lambda: self._change_all_reference_colours("paper"))
         self.change_all_ink_button = QPushButton("Set all ink colours")
-        self.change_all_ink_button.setToolTip("Set the same ink reference colour for all three images.")
+        self.change_all_ink_button.setToolTip("Set the same ink reference colour for all selected images.")
         self.change_all_ink_button.setMinimumWidth(180)
         self.change_all_ink_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.change_all_ink_button.clicked.connect(lambda: self._change_all_reference_colours("ink"))
 
         self.generate_all_masks_button = QPushButton("Generate masks for all")
-        self.generate_all_masks_button.setToolTip("Generate paper and ink masks for all three loaded images.")
+        self.generate_all_masks_button.setToolTip("Generate paper and ink masks for all loaded images.")
         self.generate_all_masks_button.setMinimumWidth(180)
         self.generate_all_masks_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.generate_all_masks_button.clicked.connect(self._generate_mask_for_all)
@@ -1818,7 +2006,7 @@ class MainWindow(QMainWindow):
             slider.blockSignals(False)
 
         intersection_enabled = options.use_masks and options.images_aligned
-        per_pixel_enabled = not (options.use_masks and not options.intersection_mask)
+        per_pixel_enabled = self.image_mode != "single" and not (options.use_masks and not options.intersection_mask)
         heatmap_enabled = options.per_pixel_comparison and per_pixel_enabled
 
         if hasattr(self, "intersection_mask_checkbox"):
@@ -1908,7 +2096,7 @@ class MainWindow(QMainWindow):
 
         self.intersection_mask_checkbox = QCheckBox("Intersection mask")
         self.intersection_mask_checkbox.setToolTip(
-            "Compare only pixels included in the corresponding mask in all three aligned images."
+            "Compare only pixels included in the corresponding mask in all selected aligned images."
         )
         self.intersection_mask_checkbox.setChecked(self.analysis_options.intersection_mask)
         self.intersection_mask_checkbox.toggled.connect(
@@ -2006,7 +2194,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignTop)
 
-        self.status_label = QLabel("Load B1, B2 and A to compare images.")
+        self.status_label = QLabel("Load the selected images for analysis.")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("font-size: 15px; margin: 8px;")
         layout.addWidget(self.status_label)
@@ -2050,11 +2238,11 @@ class MainWindow(QMainWindow):
         return separator.join(blocks)
 
     def analyze_images(self):
-        """Start the comparison for the three loaded images."""
+        """Start the comparison for the loaded images."""
         if self._analysis_thread is not None or not self.analyze_button.isEnabled():
             return
-        if any(self.images[key].pixels.get("rgb") is None for key in ["B1", "B2", "A"]):
-            QMessageBox.warning(self, "Missing input", "Load B1, B2, and A before running the analysis.")
+        if any(self.images[key].pixels.get("rgb") is None for key in self._active_image_keys()):
+            QMessageBox.warning(self, "Missing input", "Load the selected images before running the analysis.")
             return
 
         self._analysis_tab_states = {
@@ -2072,7 +2260,8 @@ class MainWindow(QMainWindow):
         self.analysis_progress_bar.setValue(0)
         self.status_label.setText("Analysis in progress. The previous report remains visible until it completes.")
 
-        self._analysis_thread = AnalysisThread(self.images, self.analysis_options, self)
+        images = {key: self.images[key] for key in self._active_image_keys()}
+        self._analysis_thread = AnalysisThread(images, self.analysis_options, self, mode=self.image_mode)
         self._analysis_thread.progress.connect(self._analysis_progress)
         self._analysis_thread.finished.connect(self._analysis_finished)
         self._analysis_thread.start()
@@ -2115,7 +2304,10 @@ class MainWindow(QMainWindow):
                 return
             summary_lines = self.dict_to_string(thread.result, indent=" "*4, section_break="\n"+("-" * 64)+"\n")
             self.report.setPlainText(summary_lines + "\n")
-            self.status_label.setText("Analysis complete. The report compares B1 against both B2 and A.")
+            if self.image_mode == "single":
+                self.status_label.setText("Analysis complete. The report describes the image.")
+            else:
+                self.status_label.setText("Analysis complete. The report compares the before and after images.")
             self.analysis_progress_label.setText(f"Analysis complete ({thread.total_tasks}/{thread.total_tasks} tasks).")
             self.analysis_progress_bar.setValue(100)
             for tab in (self.results_tab, self.image_results_tab):

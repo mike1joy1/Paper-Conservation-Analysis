@@ -63,6 +63,214 @@ def test_all_app_controls_have_tooltips(window):
     assert "not yet available" in window.heatmap_grid_slider_y.toolTip()
 
 
+def test_image_configuration_radios_are_compact(window):
+    window.show()
+    QTest.qWait(20)
+    buttons = list(window.image_mode_buttons.values())
+    assert window.image_configuration_group.width() < window.width() * 0.8
+    for button in buttons:
+        assert button.width() <= button.sizeHint().width() + 10
+    for left, right in zip(buttons, buttons[1:]):
+        assert 6 <= right.x() - (left.x() + left.width()) <= 30
+
+
+@pytest.mark.parametrize(
+    ("mode", "labels", "long_labels"),
+    [
+        ("one_each", ("B", "No image", "A"), ("Before Image", "After Image")),
+        ("two_before", ("B1", "B2", "A"), ("Before Image 1", "Before Image 2", "After Image")),
+        ("two_after", ("B", "A1", "A2"), ("Before Image", "After Image 1", "After Image 2")),
+    ],
+)
+def test_image_labels_follow_configuration(window, mode, labels, long_labels):
+    window.image_mode_buttons[mode].click()
+    keys = ("B1", "B2", "A")
+    assert tuple(window.alignment_buttons[key].text() for key in keys) == labels
+    assert tuple(window.image_key_labels[key] for key in window._active_image_keys()) == long_labels
+    for key in window._active_image_keys():
+        assert window.mask_generate_buttons[key].text() == f"Generate mask for {window.alignment_buttons[key].text()}"
+        assert window.mask_remove_buttons[key].text() == f"Remove mask for {window.alignment_buttons[key].text()}"
+        assert window.mask_original_labels[key].text() == f"Original {window.alignment_buttons[key].text()}"
+        assert window.mask_preview_labels[key].text() == f"Mask {window.alignment_buttons[key].text()}"
+    if mode == "one_each":
+        assert window.load_preview_labels["B2"].text() == "No image"
+        window.show()
+        window.resize(window.width() + 50, window.height() + 50)
+        QTest.qWait(20)
+        assert window.mask_original_labels["B2"].text() == "No image"
+        assert window.mask_preview_labels["B2"].text() == "No image"
+
+
+def test_single_image_mode_loads_masks_and_analyzes_without_comparison(window, monkeypatch, image_paths):
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    window.image_mode_buttons["single"].click()
+    assert window._active_image_keys() == ("B1",)
+    assert window.selected_image_paths["A"] == image_paths["A"]
+    assert window.load_select_buttons["B1"].text() == "Select Image"
+    assert window.alignment_buttons["B1"].text() == "Image"
+    assert window.load_images_button.isEnabled()
+    for key in ("B2", "A"):
+        assert not window.load_select_buttons[key].isEnabled()
+        assert window.load_preview_labels[key].text() == "No image"
+        assert window.mask_original_labels[key].text() == "No image"
+        assert window.mask_preview_labels[key].text() == "No image"
+        assert "only one image is selected" in window.load_select_buttons[key].toolTip()
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: pytest.fail(str(args)))
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    assert window.load_status_label.text() == "Images loaded (1/1)."
+    assert window.images["B1"].pixels["rgb"].shape == (3, 4, 3)
+    assert all(window.images[key].pixels.get("rgb") is None for key in ("B2", "A"))
+    assert not window.alignment_checkbox.isEnabled()
+    assert "at least two images" in window.alignment_checkbox.toolTip()
+    window.use_mask_checkbox.setChecked(True)
+    window.use_masks_checkbox.setChecked(True)
+    assert not window.intersection_mask_checkbox.isEnabled()
+    assert not window.per_pixel_comparison_checkbox.isEnabled()
+    window._generate_mask_for_all()
+    assert window.images["B1"].masks_exists["paper"]
+    messages = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: messages.append(args))
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: pytest.fail(str(args)))
+    window._export_all_masks()
+    window._auto_import_masks()
+    assert "Exported: Image" in messages[-2][2]
+    assert "Imported: Image" in messages[-1][2]
+    window.show_image_data_checkbox.setChecked(True)
+    window.analyze_button.click()
+    thread = window._analysis_thread
+    wait_until(lambda: window._analysis_thread is None)
+    assert thread.current_task == thread.total_tasks
+    report = window.report.toPlainText()
+    assert "Image Data:" in report and "Colour Average:" in report
+    assert "Colour Standard Deviation:" in report
+    assert "Before:" not in report and "After:" not in report and "Change:" not in report
+    assert "ΔE" not in report and "RGB Euclidean" not in report
+    assert "describes the image" in window.status_label.text()
+    window.image_mode_buttons["two_before"].click()
+    assert window.selected_image_paths["A"] == image_paths["A"]
+    assert not window.load_preview_labels["A"].pixmap().isNull()
+    assert window.path_labels["A"].text() == image_paths["A"]
+
+
+def test_load_preview_sizes_remain_stable_when_changing_modes(window, monkeypatch, image_paths):
+    window.show()
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    QTest.qWait(20)
+    sizes = {key: label.size() for key, label in window.load_preview_labels.items()}
+    for mode in ("one_each", "two_after", "two_before"):
+        window.image_mode_buttons[mode].click()
+        QTest.qWait(20)
+        assert {key: label.size() for key, label in window.load_preview_labels.items()} == sizes
+
+
+def test_reload_clears_all_image_data_before_loading_two_images(window, monkeypatch, image_paths):
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    window.use_mask_checkbox.setChecked(True)
+    window._generate_mask_for_all()
+    window.alignment_checkbox.setChecked(True)
+    window.mask_radio.setChecked(True)
+    window.analysis_options.int_paper_mask = np.ones((3, 4, 3))
+    window.analysis_options.int_ink_mask = np.ones((3, 4, 3))
+    window.report.setPlainText("old report")
+    window.image_mode_buttons["one_each"].click()
+    paths = window.selected_image_paths.copy()
+    started = threading.Event()
+    release = threading.Event()
+    original_load = image_data_colour.load_from_path
+
+    def paused_load(image, path, check_cancelled=None, progress=None):
+        started.set()
+        if not release.wait(5):
+            raise RuntimeError("Timed out waiting for test")
+        return original_load(image, path, check_cancelled=check_cancelled, progress=progress)
+
+    monkeypatch.setattr(image_data_colour, "load_from_path", paused_load)
+    window.load_images_button.click()
+    try:
+        wait_until(started.is_set)
+        assert window.selected_image_paths == paths
+        assert all(image.pixels.get("rgb") is None for image in window.images.values())
+        assert all(not image.masks_exists["paper"] for image in window.images.values())
+        assert window.mask_original_labels["B2"]._base_pixmap.isNull()
+        assert window.mask_preview_labels["B2"].pixmap().isNull()
+        assert window.analysis_options.int_paper_mask is None
+        assert window.analysis_options.int_ink_mask is None
+        assert not window.report.toPlainText()
+    finally:
+        release.set()
+        wait_until(lambda: window._loading_thread is None)
+    assert window.images["B2"].pixels.get("rgb") is None
+    assert window.mask_original_labels["B2"]._base_pixmap.isNull()
+    assert window.mask_original_labels["B2"].text() == "No image"
+    assert window.mask_preview_labels["B2"].text() == "No image"
+    assert window.images["B1"].pixels.get("rgb") is not None
+    assert window.images["A"].pixels.get("rgb") is not None
+    assert window.analysis_options.int_paper_mask is None
+    assert window.analysis_options.int_ink_mask is None
+    window.image_mode_buttons["two_after"].click()
+    assert window.mask_original_labels["B2"].text() == "Original A1"
+    assert window.mask_preview_labels["B2"].text() == "Mask A1"
+
+
+@pytest.mark.parametrize("mode", ["one_each", "two_after"])
+def test_image_configuration_controls_loading_masks_and_analysis(window, monkeypatch, image_paths, mode):
+    window.image_mode_buttons[mode].click()
+    active = ("B1", "A") if mode == "one_each" else ("B1", "B2", "A")
+    assert window.load_select_buttons["B2"].isEnabled() == (mode != "one_each")
+    if mode == "two_after":
+        assert window.load_select_buttons["B2"].text() == "Select After Image 1"
+        assert window.alignment_buttons["B2"].text() == "A1"
+        assert window.alignment_buttons["A"].text() == "A2"
+    else:
+        assert "only one before" in window.load_select_buttons["B2"].toolTip()
+    for key in active:
+        select_image(window, monkeypatch, key, image_paths[key])
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    assert window.load_progress_bar.value() == 100
+    assert window._images_have_identical_resolution()
+    assert window.alignment_buttons["B2"].isEnabled() == (mode != "one_each")
+    window.use_mask_checkbox.setChecked(True)
+    assert window.mask_generate_buttons["B2"].isEnabled() == (mode != "one_each")
+    window._generate_mask_for_all()
+    assert all(window.images[key].masks_exists["paper"] for key in active)
+    messages = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: messages.append(args))
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: pytest.fail(str(args)))
+    window._export_all_masks()
+    assert all(Path(window.mask_export_paths[key]).exists() for key in active)
+    window._auto_import_masks()
+    expected_labels = ", ".join(window.alignment_buttons[key].text() for key in active)
+    assert f"Imported: {expected_labels}" in messages[-1][2]
+    window.alignment_checkbox.setChecked(True)
+    paper, ink = window._get_intersection_masks_for_alignment()
+    assert paper.shape == ink.shape == (3, 4, 3)
+    window.use_masks_checkbox.setChecked(True)
+    window.intersection_mask_checkbox.setChecked(True)
+    window.show_image_data_checkbox.setChecked(True)
+    window.analyze_button.click()
+    thread = window._analysis_thread
+    wait_until(lambda: window._analysis_thread is None)
+    assert window.analysis_progress_bar.value() == 100
+    assert thread.current_task == thread.total_tasks
+    report = window.report.toPlainText()
+    assert "Before:" in report
+    if mode == "one_each":
+        assert "After:" in report and "Before 1:" not in report and "After 1:" not in report
+    else:
+        assert "After 1:" in report and "After 2:" in report and "Before 1:" not in report
+    window.image_mode_buttons["two_before"].click()
+    assert not window.selected_image_paths["B2"]
+    assert not window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.results_tab))
+    assert not window.analyze_button.isEnabled()
+
+
 def test_alignment_zoom_is_reset_only_on_first_visit(window, monkeypatch, image_paths):
     for key, path in image_paths.items():
         select_image(window, monkeypatch, key, path)
@@ -369,7 +577,7 @@ def test_mask_export_path_selection_and_reload(window, monkeypatch, image_paths,
     select_image(window, monkeypatch, "A", str(replacement))
     window.load_images_button.click()
     wait_until(lambda: window._loading_thread is None)
-    assert window.mask_export_paths["B1"] == str(custom) + ".png"
+    assert window.mask_export_paths["B1"] == default
     assert window.mask_export_paths["A"] == str(tmp_path / "replacement_mask.png")
     assert window.mask_export_buttons["B1"].isEnabled()
 
@@ -549,7 +757,7 @@ def test_select_previews_then_loads_all_images(window, monkeypatch, image_paths,
     assert window.alignment_checkbox.toolTip().endswith("(images must have the same resolution)")
 
 
-def test_failed_load_keeps_previous_set_and_blocks_downstream(window, monkeypatch, image_paths):
+def test_failed_load_clears_previous_set_and_blocks_downstream(window, monkeypatch, image_paths):
     for key, path in image_paths.items():
         select_image(window, monkeypatch, key, path)
     window.load_images_button.click()
@@ -569,7 +777,8 @@ def test_failed_load_keeps_previous_set_and_blocks_downstream(window, monkeypatc
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args))
     window.load_images_button.click()
     wait_until(lambda: window._loading_thread is None)
-    assert window.images is previous_images
+    assert window.images is not previous_images
+    assert all(image.pixels.get("rgb") is None for image in window.images.values())
     assert "B2" in errors[0][2]
     assert "test failure" in errors[0][2]
     assert not window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.results_tab))
@@ -637,7 +846,7 @@ def test_loading_progress_and_responsive_ui(window, monkeypatch, image_paths):
 
 
 @pytest.mark.parametrize("selection_changed", [False, True])
-def test_cancel_loading_preserves_previous_data_and_tab_states(window, monkeypatch, image_paths, selection_changed):
+def test_cancel_loading_leaves_data_cleared_and_paths_selected(window, monkeypatch, image_paths, selection_changed):
     for key, path in image_paths.items():
         select_image(window, monkeypatch, key, path)
     window.load_images_button.click()
@@ -649,8 +858,7 @@ def test_cancel_loading_preserves_previous_data_and_tab_states(window, monkeypat
     if selection_changed:
         select_image(window, monkeypatch, "B1", image_paths["B1"])
     previous_images = window.images
-    previous_report = window.report.toPlainText()
-    previous_tabs = [window.tab_widget.isTabEnabled(i) for i in range(1, window.tab_widget.count())]
+    selected_paths = window.selected_image_paths.copy()
     started = threading.Event()
     release = threading.Event()
     original_load = image_data_colour.load_from_path
@@ -676,10 +884,12 @@ def test_cancel_loading_preserves_previous_data_and_tab_states(window, monkeypat
         release.set()
         wait_until(lambda: window._loading_thread is None)
     assert calls == ["B1"]
-    assert window.images is previous_images
-    assert window.images["B1"].masks_exists["paper"]
-    assert window.report.toPlainText() == previous_report
-    assert [window.tab_widget.isTabEnabled(i) for i in range(1, window.tab_widget.count())] == previous_tabs
+    assert window.images is not previous_images
+    assert all(image.pixels.get("rgb") is None for image in window.images.values())
+    assert not window.images["B1"].masks_exists["paper"]
+    assert window.selected_image_paths == selected_paths
+    assert not window.report.toPlainText()
+    assert all(not window.tab_widget.isTabEnabled(i) for i in range(1, window.tab_widget.count()))
     assert window.load_status_label.text() == "Image loading cancelled."
 
     monkeypatch.setattr(image_data_colour, "load_from_path", original_load)
@@ -700,7 +910,8 @@ def test_cancel_after_loading_worker_finishes_discards_result(window, monkeypatc
     assert thread.wait(5000)
     window.cancel_load_button.click()
     wait_until(lambda: window._loading_thread is None)
-    assert window.images is previous_images
+    assert window.images is not previous_images
+    assert all(image.pixels.get("rgb") is None for image in window.images.values())
     assert window.load_status_label.text() == "Image loading cancelled."
     assert not window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.analysis_options_tab))
 
@@ -870,7 +1081,7 @@ def test_analysis_runs_off_ui_thread_and_keeps_inputs_stable(window, monkeypatch
     release = threading.Event()
     calls = []
 
-    def slow_analysis(b1, b2, after, options, *, progress, check_cancelled):
+    def slow_analysis(b1, b2, after, options, *, progress, check_cancelled, mode):
         calls.append((threading.get_ident(), options))
         progress("Preparing masks and image data")
         started.set()
@@ -926,7 +1137,7 @@ def test_analysis_error_restores_controls_and_allows_retry(window, monkeypatch, 
     errors = []
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args))
 
-    def fail_analysis(*args, progress, check_cancelled):
+    def fail_analysis(*args, progress, check_cancelled, mode):
         progress("Preparing masks and image data")
         progress("Analysing RGB colours")
         raise ValueError("analysis broke")
@@ -1169,7 +1380,7 @@ def test_analysis_reports_each_real_stage_and_completed_percentage(window, monke
             raise RuntimeError("Timed out waiting for test")
         return intersection(images, check_cancelled=check_cancelled)
 
-    def paused_analysis(b1, b2, after, options, *, progress, check_cancelled):
+    def paused_analysis(b1, b2, after, options, *, progress, check_cancelled, mode):
         def pause_at_stage(description):
             progress(description)
             if not permits.acquire(timeout=5):

@@ -568,19 +568,213 @@ def format_data_out(raw_data, paper_diff_text, ink_diff_text, c0, c1, c2, use_ma
 
 
 
+def _compare_configured_images(images, paper_masks, ink_masks, use_masks, mode,
+                               scale, distance_fn, check_cancelled, progress, colour_space):
+    """Calculate region statistics and paired distances for the selected image configuration."""
+    groups = {
+        "single": (("b1",), ()),
+        "two_before": (("b1", "b2"), ("a",)),
+        "one_each": (("b1",), ("a",)),
+        "two_after": (("b1",), ("b2", "a")),
+    }
+    labels = {
+        "single": {"b1": "Image"},
+        "two_before": {"b1": "Before Image 1", "b2": "Before Image 2", "a": "After Image"},
+        "one_each": {"b1": "Before Image", "a": "After Image"},
+        "two_after": {"b1": "Before Image", "b2": "After Image 1", "a": "After Image 2"},
+    }
+    before_keys, after_keys = groups[mode]
+    output = {}
+    for region, masks in (("paper", paper_masks), ("ink", ink_masks)):
+        if region == "ink" and not use_masks:
+            continue
+        measurements = {}
+        for key in before_keys + after_keys:
+            if progress is not None:
+                progress(f"Analysing {colour_space} {region}: {labels[mode][key]}")
+            measurements[key] = image_avg_sd(images[key], masks[key], check_cancelled)
+
+        def summarize(keys, index):
+            values = [measurements[key][index] * scale for key in keys]
+            mean = sum(values) / len(values)
+            uncertainty = abs(values[0] - values[1]) / 2 if len(values) == 2 else None
+            return mean, uncertainty
+
+        region_data = {}
+        for index, name in enumerate(("avg", "sd")):
+            before, before_pm = summarize(before_keys, index)
+            if not after_keys:
+                region_data.setdefault("image", {})[name] = before
+                region_data["image"][name + "_pm"] = None
+                continue
+            after, after_pm = summarize(after_keys, index)
+            for section, value, uncertainty in (
+                ("before", before, before_pm),
+                ("after", after, after_pm),
+                ("change", after - before, before_pm if before_pm is not None else after_pm),
+            ):
+                region_data.setdefault(section, {})[name] = value
+                region_data[section][name + "_pm"] = uncertainty
+
+        if not after_keys:
+            output[region] = region_data
+            continue
+        distances = [
+            distance_fn(measurements[before][0], measurements[after][0])
+            for before in before_keys for after in after_keys
+        ]
+        region_data["delta_e"] = {
+            name: (sum(item[name] for item in distances) / len(distances),
+                   abs(distances[0][name] - distances[1][name]) / 2 if len(distances) == 2 else None)
+            for name in distances[0]
+        }
+        output[region] = region_data
+    return output
+
+
+def _format_configured_data(raw_data, paper_text, ink_text, channels, use_masks,
+                            dec_place, delta_e_heading):
+    """Format region statistics, omitting unavailable replicate uncertainties."""
+    result = {}
+
+    def format_value(value, uncertainty, signed=False, width=None):
+        prefix = "+" if signed else ""
+        width = width if width is not None else 4 + dec_place
+        text = f"{value:{prefix}{width}.{dec_place}f}"
+        if uncertainty is not None:
+            text += f"  (±{uncertainty:.{dec_place}f})"
+        return text
+
+    for region, heading, summary in (
+        ("paper", "Paper" if use_masks else "Whole image", paper_text),
+        ("ink", "Ink", ink_text),
+    ):
+        if region == "ink" and not use_masks:
+            continue
+        data = raw_data[region]
+        output = result[heading] = {}
+        sections = ("image",) if "image" in data else ("before", "after", "change")
+        for section in sections:
+            section_data = output[section.title()] = {}
+            for field, label in (("avg", "Colour Average"), ("sd", "Colour Standard Deviation")):
+                values = data[section][field]
+                uncertainties = data[section][field + "_pm"]
+                section_data[label] = {
+                    channel: format_value(values[index], None if uncertainties is None else uncertainties[index],
+                                          signed=section == "change")
+                    for index, channel in enumerate(channels)
+                }
+            if section == "change":
+                section_data["Summary"] = dict(zip(channels, summary))
+                section_data[delta_e_heading] = {
+                    name.ljust(6): format_value(value, uncertainty, width=3 + dec_place)
+                    for name, (value, uncertainty) in data["delta_e"].items()
+                }
+    return result
+
+
+def _image_report_data(image, paper_mask, ink_mask):
+    """Summarise the image dimensions and paper/ink mask coverage."""
+    pixels = image.get_pixels("rgb")
+    total = np.prod(pixels.shape[:2])
+    paper = np.sum(paper_mask) / 3
+    ink = np.sum(ink_mask) / 3
+    unused = total - np.sum(np.maximum(paper_mask, ink_mask)) / 3
+    both = np.sum(np.minimum(paper_mask, ink_mask)) / 3
+    return {
+        "Image Array Shape": pixels.shape,
+        "Resolution": str(pixels.shape[0]) + "x" + str(pixels.shape[1]),
+        "Total Pixels": str(total),
+        "Paper Mask Array Shape": paper_mask.shape,
+        "Paper Pixels": str(paper),
+        "Paper Percentage": str(paper / total * 100.0),
+        "Ink Mask Array Shape": ink_mask.shape,
+        "Ink Pixels": str(ink),
+        "Ink Percentage": str(ink / total * 100.0),
+        "Unused Pixels": str(unused),
+        "Unused Percentage": str(unused / total * 100.0),
+        "Pixels in Both": str(both),
+        "Pixels in Both Percentage": str(both / total * 100.0),
+    }
+
+
+def _analyze_single_image(image, op, progress, check_cancelled):
+    """Report one image's masked colour statistics without comparison metrics."""
+    if check_cancelled is not None:
+        check_cancelled()
+    if progress is not None:
+        progress("Preparing masks and image data")
+    results = {}
+    if op.show_analysis_options:
+        results["Analysis Options"] = op.to_dict()
+    paper = image.masks["paper"]
+    ink = image.masks["ink"]
+    if not op.use_masks:
+        paper = np.ones_like(paper, dtype=bool)
+        ink = np.ones_like(ink, dtype=bool)
+    if check_cancelled is not None:
+        check_cancelled()
+    if progress is not None:
+        progress("Summarising mask data")
+    if op.show_image_data:
+        if progress is not None:
+            progress("Compiling image data")
+        results["Image Data"] = {"Image": _image_report_data(image, paper, ink)}
+
+    dec_place = op.dec_places
+    for enabled, space, heading, channels, scale, distance_fn in (
+        (op.rgb_comparison, "RGB", "RGB colour space", ("R", "G", "B"), 100.0, rgb_distance_dict),
+        (op.lab_comparison, "CIELAB", "CIELAB (L*a*b*) colour space", ("L*", "a*", "b*"), 1.0, delta_e_dict),
+    ):
+        if not enabled:
+            continue
+        if progress is not None:
+            progress(f"Analysing {space} colours")
+        if space == "RGB":
+            results[heading] = {"(Scale": f"{0.0:.{dec_place}f} to {scale:.{dec_place}f})"}
+            pixels = image.get_pixels("rgb")
+        else:
+            results[heading] = {
+                "(L* Scale": f"{0.0:.{dec_place}f} to {100.0:.{dec_place}f})",
+                "(a*b* Scale": f"{-100.0:.{dec_place}f} to {100.0:.{dec_place}f})",
+            }
+            pixels = image.get_pixels("lab")
+        if op.mean_comparison:
+            raw = _compare_configured_images(
+                {"b1": pixels}, {"b1": paper}, {"b1": ink}, op.use_masks, "single",
+                scale, distance_fn, check_cancelled, progress, space,
+            )
+            results[heading].update(_format_configured_data(raw, (), (), channels, op.use_masks, dec_place, ""))
+    if check_cancelled is not None:
+        check_cancelled()
+    return results
+
+
 def image_analysis_b1_b2_a(
     b1: image_data_colour,
-    b2: image_data_colour,
-    a: image_data_colour,
+    b2: image_data_colour | None,
+    a: image_data_colour | None,
     op: analysis_options,
     progress: Callable[[str], None] | None = None,
     check_cancelled: Callable[[], None] | None = None,
+    mode: str = "two_before",
 ) -> dict:
-    """Compare B1 and B2 with A and return the formatted analysis data.
+    """Compare the configured before and after images and return the formatted report.
 
     If provided, progress is called with each task's description as it starts.
     check_cancelled may raise to stop the analysis between expensive operations.
     """
+
+    if mode not in ("single", "two_before", "one_each", "two_after"):
+        raise ValueError(f"Unknown image configuration: {mode}")
+    if mode == "single":
+        return _analyze_single_image(b1, op, progress, check_cancelled)
+    if a is None:
+        raise ValueError("The selected configuration requires an after image.")
+    if mode == "one_each":
+        b2 = b1
+    elif b2 is None:
+        raise ValueError("The selected configuration requires a middle image.")
 
     if check_cancelled is not None:
         check_cancelled()
@@ -686,21 +880,7 @@ def image_analysis_b1_b2_a(
         if progress is not None:
             progress("Compiling image data")
         results["Image Data"] = {
-            "Before 1": {
-                "Image Array Shape": b1.get_pixels("rgb").shape,
-                "Resolution": str(b1.pixels.get("rgb").shape[0]) + "x" + str(b1.pixels.get("rgb").shape[1]),
-                "Total Pixels": str(np.prod(b1.pixels.get("rgb").shape[:2])),
-                "Paper Mask Array Shape": paper_mask["b1"].shape,
-                "Paper Pixels": str(np.sum(paper_mask["b1"])/3),
-                "Paper Percentage": str((np.sum(paper_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
-                "Ink Mask Array Shape": ink_mask["b1"].shape,
-                "Ink Pixels": str(np.sum(ink_mask["b1"])/3),
-                "Ink Percentage": str((np.sum(ink_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
-                "Unused Pixels": str(np.prod(b1.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b1"])/3),
-                "Unused Percentage": str((np.prod(b1.pixels.get("rgb").shape[:2])-np.sum(test_union_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0),
-                "Pixels in Both": str(np.sum(test_intersection_mask["b1"])/3),
-                "Pixels in Both Percentage": str((np.sum(test_intersection_mask["b1"])/3)/np.prod(b1.pixels.get("rgb").shape[:2])*100.0)
-            },
+            "Before 1": _image_report_data(b1, paper_mask["b1"], ink_mask["b1"]),
             "Before 2": {
                 "Image Array Shape": b2.get_pixels("rgb").shape,
                 "Resolution": str(b2.pixels.get("rgb").shape[0]) + "x" + str(b2.pixels.get("rgb").shape[1]),
@@ -733,6 +913,17 @@ def image_analysis_b1_b2_a(
             }
         }
 
+    if op.show_image_data:
+        image_data = results["Image Data"]
+        if mode == "one_each":
+            results["Image Data"] = {"Before": image_data["Before 1"], "After": image_data["After"]}
+        elif mode == "two_after":
+            results["Image Data"] = {
+                "Before": image_data["Before 1"],
+                "After 1": image_data["Before 2"],
+                "After 2": image_data["After"],
+            }
+
     dec_place = op.dec_places
     
     # RGB comparisons
@@ -751,7 +942,7 @@ def image_analysis_b1_b2_a(
         results[rgb_mean_heading] = {"(Scale": f"{0.0:.{dec_place}f} to {rgb_scale:.{dec_place}f})"}
 
         if op.mean_comparison:
-            raw_data_rgb = compare_b1_b2_a(rgb["b1"], rgb["b2"], rgb["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=rgb_scale, delta_e=True, delta_e_fn=rgb_distance_dict, check_cancelled=check_cancelled, progress=progress, colour_space="RGB")
+            raw_data_rgb = _compare_configured_images(rgb, paper_mask, ink_mask, op.use_masks, mode, rgb_scale, rgb_distance_dict, check_cancelled, progress, "RGB")
             
             rgb_paper_diff_text = describe_rgb_change(raw_data_rgb["paper"]["change"]["avg"]/rgb_scale)
             if op.use_masks:
@@ -759,7 +950,7 @@ def image_analysis_b1_b2_a(
             else:
                 rgb_ink_diff_text = ["","",""]
 
-            results[rgb_mean_heading].update(format_data_out(raw_data_rgb,rgb_paper_diff_text,rgb_ink_diff_text,"R","G","B",op.use_masks,dec_place,True,delta_e_heading="Colour Difference (RGB)"))
+            results[rgb_mean_heading].update(_format_configured_data(raw_data_rgb, rgb_paper_diff_text, rgb_ink_diff_text, ("R", "G", "B"), op.use_masks, dec_place, "Colour Difference (RGB)"))
 
         # Per-pixel comparison (todo)
         if op.per_pixel_comparison:
@@ -832,7 +1023,7 @@ def image_analysis_b1_b2_a(
 
         # mean comparison
         if op.mean_comparison:
-            raw_data_lab = compare_b1_b2_a(lab["b1"], lab["b2"], lab["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=lab_scale, delta_e=True, check_cancelled=check_cancelled, progress=progress, colour_space="CIELAB")
+            raw_data_lab = _compare_configured_images(lab, paper_mask, ink_mask, op.use_masks, mode, lab_scale, delta_e_dict, check_cancelled, progress, "CIELAB")
             
             lab_paper_diff_text = describe_lab_change(raw_data_lab["paper"]["change"]["avg"]/lab_scale)
             if op.use_masks:
@@ -840,7 +1031,7 @@ def image_analysis_b1_b2_a(
             else:
                 lab_ink_diff_text = ["","",""]
 
-            results[lab_mean_heading].update(format_data_out(raw_data_lab,lab_paper_diff_text,lab_ink_diff_text,"L*","a*","b*",op.use_masks,dec_place, True))
+            results[lab_mean_heading].update(_format_configured_data(raw_data_lab, lab_paper_diff_text, lab_ink_diff_text, ("L*", "a*", "b*"), op.use_masks, dec_place, "Perceptual Colour Difference (ΔE)"))
 
 
         # Per-pixel comparison (todo)
