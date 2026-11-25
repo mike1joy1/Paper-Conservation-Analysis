@@ -22,3 +22,4 @@ dist/
 # Test and analysis outputs
 .pytest_cache/
 .coverage
+*[dD][eE][bB][uU][gG]*
