@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Callable
 
 import numpy as np
 from PIL import Image
