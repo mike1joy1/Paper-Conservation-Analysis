@@ -10,8 +10,6 @@
 - Normals/depthmap mode plan
 
 ## UI
-- Allow for single before image / double after image
-- Allow for single image analysis
 - Export results (csv?)
 - Export heatmaps (png?)
 

@@ -22,7 +22,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from PySide6.QtCore import Qt, QSize, QThread, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, Qt, QSize, QThread, Signal, Slot
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication,
@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QStyleOptionTab,
     QTabBar,
     QTabWidget,
+    QToolButton,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -867,10 +868,10 @@ class MainWindow(QMainWindow):
         self.image_configuration_group.setTitle("Images to analyse" if mode == "single" else "Images to compare")
         self.analysis_settings_group.setTitle("Analysis settings" if mode == "single" else "Comparison settings")
         for widget, single_text, comparison_text, single_tip, comparison_tip in (
-            (self.rgb_comparison_checkbox, "RGB analysis", "RGB comparison",
-             "Include RGB colour statistics in the results.", "Include RGB colour comparisons in the results."),
-            (self.lab_comparison_checkbox, "LAB analysis", "LAB comparison",
-             "Include CIELAB colour statistics in the results.", "Include CIELAB colour comparisons in the results."),
+            (self.rgb_comparison_checkbox, "sRGB analysis", "sRGB comparison",
+             "Include sRGB colour statistics in the results.", "Include sRGB colour comparisons in the results."),
+            (self.lab_comparison_checkbox, "CEILAB analysis", "CEILAB comparison",
+             "Include CEILAB colour statistics in the results.", "Include CEILAB colour comparisons in the results."),
             (self.mean_comparison_checkbox, "Mean colour statistics", "Mean comparison",
              "Report average colours and their standard deviations.", "Compare average colours and report their differences."),
         ):
@@ -1799,7 +1800,7 @@ class MainWindow(QMainWindow):
             lambda value: self.mask_threshold_label.setText(f"Luminance threshold: {value}")
         )
         settings_layout.addWidget(self.mask_threshold_label)
-        settings_layout.addWidget(self.mask_threshold_slider)
+        settings_layout.addLayout(self._slider_with_editor(self.mask_threshold_slider, 80))
 
         self.reference_weight_slider = QSlider(Qt.Horizontal)
         self.reference_weight_slider.setToolTip(
@@ -1814,7 +1815,7 @@ class MainWindow(QMainWindow):
             lambda value: self.reference_weight_label.setText(f"Reference weight: {value / 100.0:.2f}")
         )
         settings_layout.addWidget(self.reference_weight_label)
-        settings_layout.addWidget(self.reference_weight_slider)
+        settings_layout.addLayout(self._slider_with_editor(self.reference_weight_slider, 50, divisor=100))
 
         self.mask_border_slider = QSlider(Qt.Horizontal)
         self.mask_border_slider.setToolTip("Set how many pixels to exclude from mask boundaries.")
@@ -1826,7 +1827,7 @@ class MainWindow(QMainWindow):
             lambda value: self.mask_border_label.setText(f"Mask border: {value} px")
         )
         settings_layout.addWidget(self.mask_border_label)
-        settings_layout.addWidget(self.mask_border_slider)
+        settings_layout.addLayout(self._slider_with_editor(self.mask_border_slider, 4))
 
         layout.addWidget(settings_group)
 
@@ -1969,6 +1970,97 @@ class MainWindow(QMainWindow):
         self._set_mask_mode("luminance")
         return page
 
+    def _add_options_heading(self, layout, text):
+        """Add a bold section title to the analysis options."""
+        heading = QLabel(text)
+        heading.setStyleSheet("font-weight: bold; margin-top: 8px;")
+        layout.addWidget(heading)
+
+    def _make_reset_button(self, default_text):
+        """Create the flat ↺ glyph used to reset a value to its default."""
+        button = QToolButton()
+        button.setText("\u21ba")
+        button.setAutoRaise(True)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setToolTip(f"Reset to default ({default_text})")
+        button.setStyleSheet(
+            "QToolButton { border: none; background: transparent; font-size: 16px; font-weight: bold;"
+            " color: palette(highlight); }"
+            "QToolButton:disabled { color: #7a7a7a; }"
+        )
+        return button
+
+    def _slider_with_editor(self, slider, default, divisor=1):
+        """Return a row holding the slider, a typed-value box and a reset glyph.
+
+        The slider stays the source of truth; divisor maps its integer value to the displayed one.
+        The editor and reset glyph follow the slider's value and enabled state.
+        """
+        decimals = len(str(divisor)) - 1
+        fmt = lambda value: f"{value / divisor:.{decimals}f}"
+        line_edit = QLineEdit(fmt(slider.value()))
+        line_edit.setMaximumWidth(56)
+        line_edit.setToolTip("Or type the value directly.")
+        button = self._make_reset_button(fmt(default))
+
+        def sync():
+            line_edit.blockSignals(True)
+            line_edit.setText(fmt(slider.value()))
+            line_edit.blockSignals(False)
+            line_edit.setEnabled(slider.isEnabled())
+            button.setEnabled(slider.isEnabled() and slider.value() != default)
+
+        def from_input():
+            try:
+                value = round(float(line_edit.text()) * divisor)
+            except ValueError:
+                sync()
+                return
+            slider.setValue(max(slider.minimum(), min(slider.maximum(), value)))
+            sync()
+
+        class EnabledWatcher(QObject):
+            def eventFilter(self, obj, event):
+                if event.type() == QEvent.EnabledChange:
+                    sync()
+                return False
+
+        watcher = EnabledWatcher(slider)
+        slider.installEventFilter(watcher)
+        slider.valueChanged.connect(lambda _value: sync())
+        line_edit.editingFinished.connect(from_input)
+        button.clicked.connect(lambda: slider.setValue(default))
+        slider.sync_editor = sync
+        sync()
+
+        row = QHBoxLayout()
+        row.addWidget(slider)
+        row.addWidget(line_edit)
+        row.addWidget(button)
+        return row
+
+    def _add_scale_reset_button(self, row, attr, slider, line_edit):
+        """Add a ↺ glyph that resets an analysis scale; it is greyed out while the value is the default."""
+        default = getattr(analysis_options(), attr)
+        button = self._make_reset_button(f"{default:g}")
+
+        def on_click():
+            line_edit.setText(f"{default:g}")
+            line_edit.editingFinished.emit()
+
+        button.clicked.connect(on_click)
+        slider.valueChanged.connect(lambda _value: self._update_scale_reset_button(attr))
+        line_edit.editingFinished.connect(lambda: self._update_scale_reset_button(attr))
+        row.addWidget(button)
+        if not hasattr(self, "scale_reset_buttons"):
+            self.scale_reset_buttons = {}
+        self.scale_reset_buttons[attr] = (button, default)
+        self._update_scale_reset_button(attr)
+
+    def _update_scale_reset_button(self, attr):
+        button, default = self.scale_reset_buttons[attr]
+        button.setEnabled(getattr(self.analysis_options, attr) != default)
+
     def _refresh_analysis_options_state(self):
         """Keep the analysis option controls and their enabled states in sync with the stored settings."""
         if not hasattr(self, "analysis_options"):
@@ -1993,17 +2085,42 @@ class MainWindow(QMainWindow):
         if hasattr(self, "use_masks_checkbox"):
             self.use_masks_checkbox.setEnabled(self.use_mask_checkbox.isChecked())
 
+        if hasattr(self, "srgb_scale_slider"):
+            slider = self.srgb_scale_slider
+            slider.blockSignals(True)
+            slider.setValue(int(options.srgb_scale))
+            slider.blockSignals(False)
+            self.srgb_scale_input.blockSignals(True)
+            self.srgb_scale_input.setText(f"{options.srgb_scale:.1f}")
+            self.srgb_scale_input.blockSignals(False)
+            self.srgb_scale_label.setText(f"sRGB scale: {options.srgb_scale:.1f}")
+
+        for attr, (label, title, slider, line_edit) in getattr(self, "ceilab_scale_controls", {}).items():
+            value = getattr(options, attr)
+            slider.blockSignals(True)
+            slider.setValue(int(value))
+            slider.blockSignals(False)
+            line_edit.blockSignals(True)
+            line_edit.setText(f"{value:.1f}")
+            line_edit.blockSignals(False)
+            label.setText(f"{title}: {value:.1f}")
+
+        for attr in getattr(self, "scale_reset_buttons", {}):
+            self._update_scale_reset_button(attr)
+
         if hasattr(self, "heatmap_grid_slider_x"):
             slider = self.heatmap_grid_slider_x
             slider.blockSignals(True)
             slider.setValue(options.heatmap_grid_size_x)
             slider.blockSignals(False)
+            slider.sync_editor()
 
         if hasattr(self, "heatmap_grid_slider_y"):
             slider = self.heatmap_grid_slider_y
             slider.blockSignals(True)
             slider.setValue(options.heatmap_grid_size_y)
             slider.blockSignals(False)
+            slider.sync_editor()
 
         intersection_enabled = options.use_masks and options.images_aligned
         per_pixel_enabled = self.image_mode != "single" and not (options.use_masks and not options.intersection_mask)
@@ -2055,6 +2172,7 @@ class MainWindow(QMainWindow):
         self.show_anaysis_options_checkbox.toggled.connect(
             lambda checked: self.analysis_options.sync_from_ui(show_analysis_options=checked)
         )
+        self._add_options_heading(options_layout, "Debug data")
         options_layout.addWidget(self.show_anaysis_options_checkbox)
 
         self.show_image_data_checkbox = QCheckBox("Show image data")
@@ -2065,21 +2183,115 @@ class MainWindow(QMainWindow):
         )
         options_layout.addWidget(self.show_image_data_checkbox)
 
-        self.rgb_comparison_checkbox = QCheckBox("RGB comparison")
-        self.rgb_comparison_checkbox.setToolTip("Include RGB colour comparisons in the results.")
+        self.rgb_comparison_checkbox = QCheckBox("sRGB comparison")
+        self.rgb_comparison_checkbox.setToolTip("Include sRGB colour comparisons in the results.")
         self.rgb_comparison_checkbox.setChecked(self.analysis_options.rgb_comparison)
         self.rgb_comparison_checkbox.toggled.connect(
             lambda checked: self.analysis_options.sync_from_ui(rgb_comparison=checked)
         )
+        self._add_options_heading(options_layout, "Colour space")
         options_layout.addWidget(self.rgb_comparison_checkbox)
 
-        self.lab_comparison_checkbox = QCheckBox("LAB comparison")
-        self.lab_comparison_checkbox.setToolTip("Include CIELAB colour comparisons in the results.")
+        self.lab_comparison_checkbox = QCheckBox("CEILAB comparison")
+        self.lab_comparison_checkbox.setToolTip("Include CEILAB colour comparisons in the results.")
         self.lab_comparison_checkbox.setChecked(self.analysis_options.lab_comparison)
         self.lab_comparison_checkbox.toggled.connect(
             lambda checked: self.analysis_options.sync_from_ui(lab_comparison=checked)
         )
         options_layout.addWidget(self.lab_comparison_checkbox)
+
+        self.srgb_scale_label = QLabel(f"sRGB scale: {self.analysis_options.srgb_scale:.1f}")
+        self.srgb_scale_label.setToolTip("Set the scale for sRGB values (at 1.0, values range 0-1).")
+        self._add_options_heading(options_layout, "Scales")
+        options_layout.addWidget(self.srgb_scale_label)
+        
+        scale_row_srgb = QHBoxLayout()
+        self.srgb_scale_slider = QSlider(Qt.Horizontal)
+        self.srgb_scale_slider.setToolTip("Adjust the sRGB scale factor.")
+        self.srgb_scale_slider.setRange(1, 1000)
+        self.srgb_scale_slider.setValue(int(self.analysis_options.srgb_scale))
+        self.srgb_scale_slider.setFixedHeight(18)
+        self.srgb_scale_input = QLineEdit()
+        self.srgb_scale_input.setPlaceholderText("255.0")
+        self.srgb_scale_input.setMaximumWidth(56)
+        self.srgb_scale_input.setText(str(self.analysis_options.srgb_scale))
+        self.srgb_scale_input.setToolTip("Or type the sRGB scale value directly.")
+        
+        def update_srgb_scale_from_slider(value):
+            self.analysis_options.srgb_scale = float(value)
+            self.srgb_scale_input.blockSignals(True)
+            self.srgb_scale_input.setText(f"{value:.1f}")
+            self.srgb_scale_input.blockSignals(False)
+            self.srgb_scale_label.setText(f"sRGB scale: {value:.1f}")
+        
+        def update_srgb_scale_from_input():
+            try:
+                value = float(self.srgb_scale_input.text())
+                value = max(1.0, min(1000.0, value))
+                self.srgb_scale_slider.blockSignals(True)
+                self.srgb_scale_slider.setValue(int(value))
+                self.srgb_scale_slider.blockSignals(False)
+                self.analysis_options.srgb_scale = value
+                self.srgb_scale_label.setText(f"sRGB scale: {value:.1f}")
+            except ValueError:
+                self.srgb_scale_input.setText(str(int(self.srgb_scale_slider.value())))
+        
+        self.srgb_scale_slider.valueChanged.connect(update_srgb_scale_from_slider)
+        self.srgb_scale_input.editingFinished.connect(update_srgb_scale_from_input)
+        scale_row_srgb.addWidget(self.srgb_scale_slider)
+        scale_row_srgb.addWidget(self.srgb_scale_input)
+        self._add_scale_reset_button(scale_row_srgb, "srgb_scale", self.srgb_scale_slider, self.srgb_scale_input)
+        options_layout.addLayout(scale_row_srgb)
+
+        self.ceilab_scale_controls = {}
+        for attr, title, tip, default in (
+            ("ceilab_l_scale", "CEILAB L* scale",
+             "L* is shown from 0 to this value (CIELAB L* nominally spans 0-100).", "100.0"),
+            ("ceilab_ab_scale", "CEILAB a*/b* scale",
+             "a* and b* are shown from minus to plus this value (commonly clamped to -128..127).", "128.0"),
+        ):
+            label = QLabel(f"{title}: {getattr(self.analysis_options, attr):.1f}")
+            label.setToolTip(tip)
+            options_layout.addWidget(label)
+
+            row = QHBoxLayout()
+            slider = QSlider(Qt.Horizontal)
+            slider.setToolTip(f"Adjust the {title.lower()} factor.")
+            slider.setRange(1, 1000)
+            slider.setValue(int(getattr(self.analysis_options, attr)))
+            slider.setFixedHeight(18)
+            line_edit = QLineEdit()
+            line_edit.setPlaceholderText(default)
+            line_edit.setMaximumWidth(56)
+            line_edit.setText(str(getattr(self.analysis_options, attr)))
+            line_edit.setToolTip(f"Or type the {title.lower()} value directly.")
+
+            def from_slider(value, attr=attr, title=title, label=label, line_edit=line_edit):
+                setattr(self.analysis_options, attr, float(value))
+                line_edit.blockSignals(True)
+                line_edit.setText(f"{value:.1f}")
+                line_edit.blockSignals(False)
+                label.setText(f"{title}: {value:.1f}")
+
+            def from_input(attr=attr, title=title, label=label, slider=slider, line_edit=line_edit):
+                try:
+                    value = max(1.0, min(1000.0, float(line_edit.text())))
+                except ValueError:
+                    line_edit.setText(str(int(slider.value())))
+                    return
+                slider.blockSignals(True)
+                slider.setValue(int(value))
+                slider.blockSignals(False)
+                setattr(self.analysis_options, attr, value)
+                label.setText(f"{title}: {value:.1f}")
+
+            slider.valueChanged.connect(from_slider)
+            line_edit.editingFinished.connect(from_input)
+            row.addWidget(slider)
+            row.addWidget(line_edit)
+            self._add_scale_reset_button(row, attr, slider, line_edit)
+            options_layout.addLayout(row)
+            self.ceilab_scale_controls[attr] = (label, title, slider, line_edit)
 
         self.use_masks_checkbox = QCheckBox("Use masks")
         self.use_masks_checkbox.setToolTip(
@@ -2092,6 +2304,7 @@ class MainWindow(QMainWindow):
                 self._refresh_analysis_options_state(),
             )
         )
+        self._add_options_heading(options_layout, "Masks")
         options_layout.addWidget(self.use_masks_checkbox)
 
         self.intersection_mask_checkbox = QCheckBox("Intersection mask")
@@ -2113,6 +2326,7 @@ class MainWindow(QMainWindow):
         self.mean_comparison_checkbox.toggled.connect(
             lambda checked: self.analysis_options.sync_from_ui(mean_comparison=checked)
         )
+        self._add_options_heading(options_layout, "Micro / macro analysis")
         options_layout.addWidget(self.mean_comparison_checkbox)
 
         self.per_pixel_comparison_checkbox = QCheckBox("Per-pixel comparison")
@@ -2141,7 +2355,8 @@ class MainWindow(QMainWindow):
             lambda value: heatmap_label_x.setText(f"Heatmap x divisions: {value}")
         )
         options_layout.addWidget(heatmap_label_x)
-        options_layout.addWidget(self.heatmap_grid_slider_x)
+        options_layout.addLayout(self._slider_with_editor(
+            self.heatmap_grid_slider_x, analysis_options().heatmap_grid_size_x))
 
         self.heatmap_grid_slider_y = QSlider(Qt.Horizontal)
         self.heatmap_grid_slider_y.setToolTip(
@@ -2158,7 +2373,8 @@ class MainWindow(QMainWindow):
             lambda value: heatmap_label_y.setText(f"Heatmap y divisions: {value}")
         )
         options_layout.addWidget(heatmap_label_y)
-        options_layout.addWidget(self.heatmap_grid_slider_y)
+        options_layout.addLayout(self._slider_with_editor(
+            self.heatmap_grid_slider_y, analysis_options().heatmap_grid_size_y))
 
         layout.addWidget(self.analysis_settings_group)
         self.analyze_button = QPushButton("Analyse")

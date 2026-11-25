@@ -724,7 +724,7 @@ def test_select_previews_then_loads_all_images(window, monkeypatch, image_paths,
     window.tab_widget.setCurrentWidget(window.analysis_options_tab)
     window.analyze_button.click()
     wait_until(lambda: window._analysis_thread is None)
-    assert "Overall change in RGB colour space" in window.report.toPlainText()
+    assert "Overall change in sRGB colour space" in window.report.toPlainText()
     assert window.tab_widget.currentWidget() is window.results_tab
     assert window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.results_tab))
     assert window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.image_results_tab))
@@ -1229,7 +1229,7 @@ def test_cancel_analysis_stops_worker_and_preserves_results(window, monkeypatch,
     monkeypatch.setattr(workflow, "image_avg_sd", original_avg_sd)
     window.analyze_button.click()
     wait_until(lambda: window._analysis_thread is None)
-    assert "Overall change in RGB colour space" in window.report.toPlainText()
+    assert "Overall change in sRGB colour space" in window.report.toPlainText()
     assert window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.results_tab))
 
 
@@ -1423,7 +1423,7 @@ def test_analysis_reports_each_real_stage_and_completed_percentage(window, monke
 
     assert window.analysis_progress_bar.value() == 100
     assert window.analysis_progress_label.text() == "Analysis complete (17/17 tasks)."
-    assert "Overall change in RGB colour space" in window.report.toPlainText()
+    assert "Overall change in sRGB colour space" in window.report.toPlainText()
 
 
 @pytest.mark.parametrize(("rgb", "lab", "total"), [(False, False, 2), (True, False, 6), (False, True, 6)])

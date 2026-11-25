@@ -8,8 +8,8 @@ reference image and the comparison images.
 
 from __future__ import annotations
 
+import math
 import os
-from collections.abc import Callable
 
 import numpy as np
 from PIL import Image
@@ -115,7 +115,7 @@ def delta_e_dict(ref_lab, new_lab):
 
 
 def rgb_distance_dict(ref_rgb, new_rgb):
-    """Compare RGB means in 0..1, returning distances on the report's 0..100 scale."""
+    """Compare sRGB means in 0..1, returning distances on the report's 0..100 scale."""
     ref = np.asarray(ref_rgb, dtype=np.float64)
     new = np.asarray(new_rgb, dtype=np.float64)
     if ref.shape != (3,) or new.shape != (3,):
@@ -124,8 +124,8 @@ def rgb_distance_dict(ref_rgb, new_rgb):
     dr, dg, db = (new - ref) * 100.0
     red_mean_8bit = (ref[0] + new[0]) * 255.0 / 2.0
     return {
-        "RGB Euclidean": float(np.sqrt(dr ** 2 + dg ** 2 + db ** 2)),
-        "RGB redmean": float(np.sqrt(
+        "sRGB Euclidean": float(np.sqrt(dr ** 2 + dg ** 2 + db ** 2)),
+        "sRGB redmean": float(np.sqrt(
             (2.0 + red_mean_8bit / 256.0) * dr ** 2
             + 4.0 * dg ** 2
             + (2.0 + (255.0 - red_mean_8bit) / 256.0) * db ** 2
@@ -198,6 +198,37 @@ def image_avg(image, mask):
         return masked_image.reshape(-1, masked_image.shape[-1]).sum(axis=0, dtype=np.float64)*0
     else:
         return masked_image.reshape(-1, masked_image.shape[-1]).sum(axis=0, dtype=np.float64)/pixel_count
+
+CIELAB_L_RANGE = 100.0
+CIELAB_AB_RANGE = 128.0
+
+
+def _ceilab_channel_scale(op) -> np.ndarray:
+    """Per-channel multipliers mapping L* (0..100) to 0..L scale and a*/b* (-128..128) to -ab scale..ab scale."""
+    ab = op.ceilab_ab_scale / CIELAB_AB_RANGE
+    return np.array([op.ceilab_l_scale / CIELAB_L_RANGE, ab, ab])
+
+
+def _scale_decimals(scale) -> int:
+    """Decimal places giving about three significant digits for values spanning 0..scale."""
+    return max(0, round(3 - math.log10(max(float(scale), 1e-9))))
+
+
+def _channel_decimals(op, space):
+    """Per-channel decimal places for a colour space, plus the fixed ΔE decimal places."""
+    if space == "sRGB":
+        return (_scale_decimals(op.srgb_scale),) * 3, op.dec_places
+    ab = _scale_decimals(op.ceilab_ab_scale)
+    return (_scale_decimals(op.ceilab_l_scale), ab, ab), op.dec_places
+
+
+def _ceilab_scale_heading(op, dec_place) -> dict:
+    l_dp, ab_dp = dec_place[0], dec_place[1]
+    return {
+        "(L* Scale": f"{0.0:.{l_dp}f} to {op.ceilab_l_scale:.{l_dp}f})",
+        "(a*b* Scale": f"{-op.ceilab_ab_scale:.{ab_dp}f} to {op.ceilab_ab_scale:.{ab_dp}f})",
+    }
+
 
 def image_avg_sd(image, mask, check_cancelled: Callable[[], None] | None = None):
     """
@@ -633,16 +664,18 @@ def _compare_configured_images(images, paper_masks, ink_masks, use_masks, mode,
 
 
 def _format_configured_data(raw_data, paper_text, ink_text, channels, use_masks,
-                            dec_place, delta_e_heading):
-    """Format region statistics, omitting unavailable replicate uncertainties."""
+                            channel_dps, delta_e_heading, delta_e_dp=1):
+    """Format region statistics, omitting unavailable replicate uncertainties.
+
+    channel_dps gives the decimal places for each channel; delta_e_dp is used for ΔE values.
+    """
     result = {}
 
-    def format_value(value, uncertainty, signed=False, width=None):
+    def format_value(value, uncertainty, dp, signed=False):
         prefix = "+" if signed else ""
-        width = width if width is not None else 4 + dec_place
-        text = f"{value:{prefix}{width}.{dec_place}f}"
+        text = f"{value:{prefix}{3 + dp}.{dp}f}"
         if uncertainty is not None:
-            text += f"  (±{uncertainty:.{dec_place}f})"
+            text += f"  (±{uncertainty:.{dp}f})"
         return text
 
     for region, heading, summary in (
@@ -661,13 +694,13 @@ def _format_configured_data(raw_data, paper_text, ink_text, channels, use_masks,
                 uncertainties = data[section][field + "_pm"]
                 section_data[label] = {
                     channel: format_value(values[index], None if uncertainties is None else uncertainties[index],
-                                          signed=section == "change")
+                                          channel_dps[index], signed=section == "change")
                     for index, channel in enumerate(channels)
                 }
             if section == "change":
                 section_data["Summary"] = dict(zip(channels, summary))
                 section_data[delta_e_heading] = {
-                    name.ljust(6): format_value(value, uncertainty, width=3 + dec_place)
+                    name.ljust(6): format_value(value, uncertainty, delta_e_dp)
                     for name, (value, uncertainty) in data["delta_e"].items()
                 }
     return result
@@ -721,30 +754,30 @@ def _analyze_single_image(image, op, progress, check_cancelled):
             progress("Compiling image data")
         results["Image Data"] = {"Image": _image_report_data(image, paper, ink)}
 
-    dec_place = op.dec_places
-    for enabled, space, heading, channels, scale, distance_fn in (
-        (op.rgb_comparison, "RGB", "RGB colour space", ("R", "G", "B"), 100.0, rgb_distance_dict),
-        (op.lab_comparison, "CIELAB", "CIELAB (L*a*b*) colour space", ("L*", "a*", "b*"), 1.0, delta_e_dict),
+    for enabled, space, heading, channels, distance_fn in (
+        (op.rgb_comparison, "sRGB", "sRGB colour space", ("R", "G", "B"), rgb_distance_dict),
+        (op.lab_comparison, "CEILAB", "CEILAB (L*a*b*) colour space", ("L*", "a*", "b*"), delta_e_dict),
     ):
         if not enabled:
             continue
         if progress is not None:
             progress(f"Analysing {space} colours")
-        if space == "RGB":
-            results[heading] = {"(Scale": f"{0.0:.{dec_place}f} to {scale:.{dec_place}f})"}
+        channel_dps, delta_e_dp = _channel_decimals(op, space)
+        if space == "sRGB":
+            scale = op.srgb_scale
+            results[heading] = {"(Scale": f"{0.0:.{channel_dps[0]}f} to {scale:.{channel_dps[0]}f})"}
             pixels = image.get_pixels("rgb")
         else:
-            results[heading] = {
-                "(L* Scale": f"{0.0:.{dec_place}f} to {100.0:.{dec_place}f})",
-                "(a*b* Scale": f"{-100.0:.{dec_place}f} to {100.0:.{dec_place}f})",
-            }
+            scale = _ceilab_channel_scale(op)
+            results[heading] = _ceilab_scale_heading(op, channel_dps)
             pixels = image.get_pixels("lab")
         if op.mean_comparison:
             raw = _compare_configured_images(
                 {"b1": pixels}, {"b1": paper}, {"b1": ink}, op.use_masks, "single",
                 scale, distance_fn, check_cancelled, progress, space,
             )
-            results[heading].update(_format_configured_data(raw, (), (), channels, op.use_masks, dec_place, ""))
+            results[heading].update(_format_configured_data(
+                raw, (), (), channels, op.use_masks, channel_dps, "", delta_e_dp))
     if check_cancelled is not None:
         check_cancelled()
     return results
@@ -924,13 +957,14 @@ def image_analysis_b1_b2_a(
                 "After 2": image_data["After"],
             }
 
-    dec_place = op.dec_places
-    
-    # RGB comparisons
+    srgb_dps, srgb_de_dp = _channel_decimals(op, "sRGB")
+    ceilab_dps, ceilab_de_dp = _channel_decimals(op, "CEILAB")
+
+    # sRGB comparisons
     if op.rgb_comparison:
         if progress is not None:
-            progress("Analysing RGB colours")
-        rgb_scale = 100.0
+            progress("Analysing sRGB colours")
+        srgb_scale = op.srgb_scale
         rgb = {
             "b1": b1.get_pixels("rgb"),
             "b2": b2.get_pixels("rgb"),
@@ -938,19 +972,19 @@ def image_analysis_b1_b2_a(
         }
 
         # mean comparison
-        rgb_mean_heading = "Overall change in RGB colour space"
-        results[rgb_mean_heading] = {"(Scale": f"{0.0:.{dec_place}f} to {rgb_scale:.{dec_place}f})"}
+        srgb_mean_heading = "Overall change in sRGB colour space"
+        results[srgb_mean_heading] = {"(Scale": f"{0.0:.{srgb_dps[0]}f} to {srgb_scale:.{srgb_dps[0]}f})"}
 
         if op.mean_comparison:
-            raw_data_rgb = _compare_configured_images(rgb, paper_mask, ink_mask, op.use_masks, mode, rgb_scale, rgb_distance_dict, check_cancelled, progress, "RGB")
+            raw_data_rgb = _compare_configured_images(rgb, paper_mask, ink_mask, op.use_masks, mode, srgb_scale, rgb_distance_dict, check_cancelled, progress, "sRGB")
             
-            rgb_paper_diff_text = describe_rgb_change(raw_data_rgb["paper"]["change"]["avg"]/rgb_scale)
+            rgb_paper_diff_text = describe_rgb_change(raw_data_rgb["paper"]["change"]["avg"]/srgb_scale)
             if op.use_masks:
-                rgb_ink_diff_text = describe_rgb_change(raw_data_rgb["ink"]["change"]["avg"]/rgb_scale)
+                rgb_ink_diff_text = describe_rgb_change(raw_data_rgb["ink"]["change"]["avg"]/srgb_scale)
             else:
                 rgb_ink_diff_text = ["","",""]
 
-            results[rgb_mean_heading].update(_format_configured_data(raw_data_rgb, rgb_paper_diff_text, rgb_ink_diff_text, ("R", "G", "B"), op.use_masks, dec_place, "Colour Difference (RGB)"))
+            results[srgb_mean_heading].update(_format_configured_data(raw_data_rgb, rgb_paper_diff_text, rgb_ink_diff_text, ("R", "G", "B"), op.use_masks, srgb_dps, "Colour Difference (sRGB)", srgb_de_dp))
 
         # Per-pixel comparison (todo)
         if op.per_pixel_comparison:
@@ -1004,34 +1038,31 @@ def image_analysis_b1_b2_a(
 
 
 
-    # LAB comparisons
+    # CEILAB comparisons
     if op.lab_comparison:
         if progress is not None:
-            progress("Analysing CIELAB colours")
-        lab_scale = 1.0
+            progress("Analysing CEILAB colours")
+        ceilab_scale = _ceilab_channel_scale(op)
         lab = {
             "b1": b1.get_pixels("lab"),
             "b2": b2.get_pixels("lab"),
             "a": a.get_pixels("lab")
         }
 
-        lab_mean_heading = "Overall change in CIELAB (L*a*b*) colour space"
-        results[lab_mean_heading] = {
-            "(L* Scale": f"{0.0:.{dec_place}f} to {lab_scale*100.0:.{dec_place}f})",
-            "(a*b* Scale": f"{-lab_scale*100.0:.{dec_place}f} to {lab_scale*100.0:.{dec_place}f})"
-        }
+        ceilab_mean_heading = "Overall change in CEILAB (L*a*b*) colour space"
+        results[ceilab_mean_heading] = _ceilab_scale_heading(op, ceilab_dps)
 
         # mean comparison
         if op.mean_comparison:
-            raw_data_lab = _compare_configured_images(lab, paper_mask, ink_mask, op.use_masks, mode, lab_scale, delta_e_dict, check_cancelled, progress, "CIELAB")
+            raw_data_lab = _compare_configured_images(lab, paper_mask, ink_mask, op.use_masks, mode, ceilab_scale, delta_e_dict, check_cancelled, progress, "CEILAB")
             
-            lab_paper_diff_text = describe_lab_change(raw_data_lab["paper"]["change"]["avg"]/lab_scale)
+            lab_paper_diff_text = describe_lab_change(raw_data_lab["paper"]["change"]["avg"]/ceilab_scale)
             if op.use_masks:
-                lab_ink_diff_text = describe_lab_change(raw_data_lab["ink"]["change"]["avg"]/lab_scale)
+                lab_ink_diff_text = describe_lab_change(raw_data_lab["ink"]["change"]["avg"]/ceilab_scale)
             else:
                 lab_ink_diff_text = ["","",""]
 
-            results[lab_mean_heading].update(_format_configured_data(raw_data_lab, lab_paper_diff_text, lab_ink_diff_text, ("L*", "a*", "b*"), op.use_masks, dec_place, "Perceptual Colour Difference (ΔE)"))
+            results[ceilab_mean_heading].update(_format_configured_data(raw_data_lab, lab_paper_diff_text, lab_ink_diff_text, ("L*", "a*", "b*"), op.use_masks, ceilab_dps, "Perceptual Colour Difference (ΔE)", ceilab_de_dp))
 
 
         # Per-pixel comparison (todo)

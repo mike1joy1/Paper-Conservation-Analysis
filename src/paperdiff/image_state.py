@@ -41,6 +41,9 @@ class analysis_options:
         
         self.rgb_comparison = True
         self.lab_comparison = True
+        self.srgb_scale = 255.0
+        self.ceilab_l_scale = 100.0
+        self.ceilab_ab_scale = 128.0
         self.use_masks = True
         self.intersection_mask = True
         self.images_aligned = False
@@ -60,6 +63,9 @@ class analysis_options:
             "show_image_data": self.show_image_data,
             "rgb_comparison": self.rgb_comparison,
             "lab_comparison": self.lab_comparison,
+            "srgb_scale": self.srgb_scale,
+            "ceilab_l_scale": self.ceilab_l_scale,
+            "ceilab_ab_scale": self.ceilab_ab_scale,
             "use_masks": self.use_masks,
             "intersection_mask": self.intersection_mask,
             "images_aligned": self.images_aligned,
@@ -77,6 +83,9 @@ class analysis_options:
             "show_image_data": self.show_image_data,
             "rgb_comparison": self.rgb_comparison,
             "lab_comparison": self.lab_comparison,
+            "srgb_scale": self.srgb_scale,
+            "ceilab_l_scale": self.ceilab_l_scale,
+            "ceilab_ab_scale": self.ceilab_ab_scale,
             "use_masks": self.use_masks,
             "intersection_mask": self.intersection_mask,
             "images_aligned": self.images_aligned,
