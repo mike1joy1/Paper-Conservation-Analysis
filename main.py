@@ -467,23 +467,20 @@ class MainWindow(QMainWindow):
         self.mask_tab = self._create_mask_tab()
         self.check_alignment_tab = self._create_check_alignment_tab()
         self.analysis_options_tab = self._create_analysis_options_tab()
-        self.results_tab = self._create_results_tab()
         self.image_results_tab = self._create_image_results_tab()
 
         self.tab_widget.addTab(self.load_tab, "1) Load images")
         self.tab_widget.addTab(self.mask_tab, "2) Mask")
         self.tab_widget.addTab(self.check_alignment_tab, "3) Check alignment")
         self.tab_widget.addTab(self.analysis_options_tab, "4) Analysis")
-        self.tab_widget.addTab(self.results_tab, "5) Results data")
-        self.tab_widget.addTab(self.image_results_tab, "6) Image results")
+        self.tab_widget.addTab(self.image_results_tab, "5) Image results")
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         self._base_tab_tooltips = dict((
             (self.load_tab, "Select, preview, and load images."),
             (self.mask_tab, "Generate paper and ink masks."),
             (self.check_alignment_tab, "Inspect image alignment."),
-            (self.analysis_options_tab, "Configure and run analysis."),
-            (self.results_tab, "View the data report."),
+            (self.analysis_options_tab, "Configure and run analysis, and view the data report."),
             (self.image_results_tab, "Image results are reserved for a future feature."),
         ))
         for tab, tooltip in self._base_tab_tooltips.items():
@@ -509,7 +506,7 @@ class MainWindow(QMainWindow):
             return "image loading is in progress"
         if self._analysis_thread is not None:
             return "analysis is in progress"
-        if tab in (self.results_tab, self.image_results_tab) and self.tab_widget.isTabEnabled(
+        if tab is self.image_results_tab and self.tab_widget.isTabEnabled(
             self.tab_widget.indexOf(self.mask_tab)
         ):
             return "analysis must be completed first"
@@ -892,7 +889,7 @@ class MainWindow(QMainWindow):
         self.analysis_progress_bar.setValue(0)
         self.analysis_progress_label.setText("Load the selected images before analysis.")
         self.report.clear()
-        for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab, self.results_tab, self.image_results_tab):
+        for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab, self.image_results_tab):
             self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
         self._refresh_disabled_tooltips()
 
@@ -929,7 +926,7 @@ class MainWindow(QMainWindow):
         self.analyze_button.setEnabled(False)
         self.analysis_progress_bar.setValue(0)
         self.analysis_progress_label.setText("Load the selected images before analysis.")
-        for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab, self.results_tab, self.image_results_tab):
+        for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab, self.image_results_tab):
             self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
         self._refresh_disabled_tooltips()
 
@@ -1050,7 +1047,7 @@ class MainWindow(QMainWindow):
             self.analysis_progress_label.setText("Ready to analyse.")
             for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab):
                 self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), True)
-            for tab in (self.results_tab, self.image_results_tab):
+            for tab in (self.image_results_tab,):
                 self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
         finally:
             self._refresh_disabled_tooltips()
@@ -1663,8 +1660,16 @@ class MainWindow(QMainWindow):
             details.append(f"Skipped or failed: {', '.join(skipped)}.")
         QMessageBox.information(self, "Export all masks", "\n".join(details))
 
+    def _reset_analysis_progress(self, *_args):
+        """Clear finished progress once settings or masks change, since the report is out of date."""
+        if self._analysis_thread is not None or not hasattr(self, "analysis_progress_label"):
+            return
+        self.analysis_progress_bar.setValue(0)
+        self.analysis_progress_label.setText("Ready to analyse.")
+
     def _update_mask_file_controls(self):
         """Enable mask import and export controls when masking is enabled."""
+        self._reset_analysis_progress()
         if not hasattr(self, "mask_export_buttons"):
             return
         enabled = self.use_mask_checkbox.isChecked()
@@ -2156,10 +2161,31 @@ class MainWindow(QMainWindow):
         self._refresh_disabled_tooltips()
 
     def _create_analysis_options_tab(self):
-        """Tab 4: configure and run the analysis."""
+        """Tab 4: configure and run the analysis, with the report beside the settings."""
         page = QWidget()
-        page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-        layout = QVBoxLayout(page)
+        page_layout = QVBoxLayout(page)
+        columns = QHBoxLayout()
+        page_layout.addLayout(columns, 1)
+
+        # The status text is still updated by the workflow but is not shown above the report.
+        self.status_label = QLabel("Load the selected images for analysis.")
+
+        self.report = QTextEdit()
+        self.report.setReadOnly(True)
+        report_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+        report_font.setPointSize(10)
+        self.report.setFont(report_font)
+        # Ignore the document's preferred height so the report follows the window height.
+        self.report.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+        self.report.setMinimumHeight(0)
+        self.report.setPlaceholderText("Analysis summary will appear here.")
+
+        settings_page = QWidget()
+        settings_page.setFixedWidth(250)
+        columns.addWidget(settings_page)
+        columns.addWidget(self.report, 1)
+        layout = QVBoxLayout(settings_page)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setAlignment(Qt.AlignTop)
 
         self.analysis_settings_group = QGroupBox("Comparison settings")
@@ -2400,33 +2426,19 @@ class MainWindow(QMainWindow):
         self.analysis_progress_label = QLabel("Ready to analyse.")
         self.analysis_progress_label.setWordWrap(True)
         layout.addWidget(self.analysis_progress_label)
+        for checkbox in self.analysis_settings_group.findChildren(QCheckBox):
+            checkbox.toggled.connect(self._reset_analysis_progress)
+        for line_edit in self.analysis_settings_group.findChildren(QLineEdit):
+            line_edit.editingFinished.connect(self._reset_analysis_progress)
+        for slider in self.analysis_settings_group.findChildren(QSlider):
+            slider.valueChanged.connect(self._reset_analysis_progress)
+        for slider in (self.mask_threshold_slider, self.reference_weight_slider, self.mask_border_slider):
+            slider.valueChanged.connect(self._reset_analysis_progress)
         self._refresh_analysis_options_state()
         return page
 
-    def _create_results_tab(self):
-        """Tab 5: display the analysis data report."""
-        page = QWidget()
-        page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-        layout = QVBoxLayout(page)
-        layout.setAlignment(Qt.AlignTop)
-
-        self.status_label = QLabel("Load the selected images for analysis.")
-        self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet("font-size: 15px; margin: 8px;")
-        layout.addWidget(self.status_label)
-
-        self.report = QTextEdit()
-        self.report.setReadOnly(True)
-        report_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-        report_font.setPointSize(10)
-        self.report.setFont(report_font)
-        self.report.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.report.setPlaceholderText("Analysis summary will appear here.")
-        layout.addWidget(self.report)
-        return page
-
     def _create_image_results_tab(self):
-        """Tab 6: reserve a place for future image results."""
+        """Tab 5: reserve a place for future image results."""
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignTop)
@@ -2526,10 +2538,10 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("Analysis complete. The report compares the before and after images.")
             self.analysis_progress_label.setText(f"Analysis complete ({thread.total_tasks}/{thread.total_tasks} tasks).")
             self.analysis_progress_bar.setValue(100)
-            for tab in (self.results_tab, self.image_results_tab):
+            for tab in (self.image_results_tab,):
                 self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), True)
             if not self._close_after_analysis:
-                self.tab_widget.setCurrentWidget(self.results_tab)
+                self.tab_widget.setCurrentWidget(self.analysis_options_tab)
         except Exception as exc:
             self.status_label.setText("Analysis failed. The previous report is unchanged.")
             self.analysis_progress_label.setText(f"Analysis failed. {self.analysis_progress_label.text()}")
