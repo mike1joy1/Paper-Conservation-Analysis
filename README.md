@@ -2,6 +2,8 @@
 
 A desktop application for comparing images of paper (with ink) and reporting visible differences between reference and comparison states. Designed for paper conservation purposes.
 
+Developed at the Centre for Print Research (CFPR), University of the West of England (UWE), Bristol, UK.
+
 ## Overview
 
 This app is designed for a simple conservation workflow:
