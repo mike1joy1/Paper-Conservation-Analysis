@@ -38,6 +38,7 @@ __all__ = [
 
 
 def _as_rgb_float(image: np.ndarray) -> np.ndarray:
+    """Convert grayscale or RGB image data to clipped floating-point RGB."""
     array = np.asarray(image, dtype=np.float32)
     if array.ndim == 2:
         array = np.repeat(array[..., None], 3, axis=-1)
@@ -47,6 +48,7 @@ def _as_rgb_float(image: np.ndarray) -> np.ndarray:
 
 
 def _smooth_rgb(image: np.ndarray, sigma: float = DEFAULT_GAUSSIAN_SIGMA) -> np.ndarray:
+    """Apply spatial Gaussian smoothing to RGB data when sigma is positive."""
     rgb = _as_rgb_float(image)
     if sigma is None or sigma <= 0:
         return rgb
@@ -82,6 +84,7 @@ def compute_deltas(before: np.ndarray, after: np.ndarray, sigma: float = DEFAULT
 
 
 def _threshold_for_mask(luma: np.ndarray, threshold: float | None = None, use_otsu: bool = False) -> float:
+    """Choose the explicit, fixed, or Otsu ink threshold."""
     if threshold is not None:
         return float(threshold)
     if use_otsu:
@@ -110,6 +113,7 @@ def compute_ink_mask(image: np.ndarray, threshold: float | None = None, sigma_in
 
 
 def _summarize(values: np.ndarray) -> dict[str, float]:
+    """Summarise values by mean, median, percentiles, and count."""
     values = np.asarray(values, dtype=np.float32)
     if values.size == 0:
         return {"mean": 0.0, "median": 0.0, "p95": 0.0, "p99": 0.0, "n": 0.0}
@@ -123,6 +127,7 @@ def _summarize(values: np.ndarray) -> dict[str, float]:
 
 
 def _region_stats(deltas: dict[str, np.ndarray], mask: np.ndarray) -> dict[str, Any]:
+    """Summarise colour-difference maps inside a region mask."""
     mask = np.asarray(mask, dtype=bool)
     dE = deltas["dE00"][mask]
     dL = deltas["dL"][mask]
@@ -149,6 +154,7 @@ def _region_stats(deltas: dict[str, np.ndarray], mask: np.ndarray) -> dict[str, 
 
 
 def _verdict_for_region(median_dE: float, baseline_p95: float) -> str:
+    """Classify a region's median difference against baseline noise."""
     if median_dE > baseline_p95:
         return "above noise"
     return "within noise"
@@ -181,7 +187,8 @@ def evaluate_reference_pair(b1: np.ndarray, b2: np.ndarray, a: np.ndarray, sigma
     base_p95_paper = float(np.percentile(b1_vs_b2["dE00"][paper_mask], 95)) if np.any(paper_mask) else 0.0
     base_p95_ink = float(np.percentile(b1_vs_b2["dE00"][ink_b1], 95)) if np.any(ink_b1) else 0.0
 
-    def _die(region: dict[str, Any], baseline_p95: float) -> dict[str, Any]:
+    def _describe_region(region: dict[str, Any], baseline_p95: float) -> dict[str, Any]:
+        """Add a noise verdict and colour-change directions to region metrics."""
         return {
             **region,
             "verdict": _verdict_for_region(region["median"], baseline_p95),
@@ -199,20 +206,21 @@ def evaluate_reference_pair(b1: np.ndarray, b2: np.ndarray, a: np.ndarray, sigma
             "reference": b1_rgb,
             "aligned": b2_rgb,
             "score": float(np.mean(b1_vs_b2["dE00"][paper_mask | ink_b1])) if np.any(paper_mask | ink_b1) else 0.0,
-            "paper": _die(base_paper, base_p95_paper),
-            "ink": _die(base_ink, base_p95_ink),
+            "paper": _describe_region(base_paper, base_p95_paper),
+            "ink": _describe_region(base_ink, base_p95_ink),
         },
         "test": {
             "reference": b1_rgb,
             "aligned": a_rgb,
             "score": float(np.mean(b1_vs_a["dE00"][paper_mask | ink_b1])) if np.any(paper_mask | ink_b1) else 0.0,
-            "paper": _die(test_paper, base_p95_paper),
-            "ink": _die(test_ink, base_p95_ink),
+            "paper": _describe_region(test_paper, base_p95_paper),
+            "ink": _describe_region(test_ink, base_p95_ink),
         },
     }
 
 
 def compute_ink_area_metrics(b1: np.ndarray, b2: np.ndarray, a: np.ndarray, threshold: float | None = None, pixel_size_mm: float | None = None, use_otsu: bool = False) -> dict[str, Any]:
+    """Measure ink areas and changes relative to the first before image."""
     b1_rgb = _as_rgb_float(b1)
     b2_rgb = _as_rgb_float(b2)
     a_rgb = _as_rgb_float(a)
@@ -222,15 +230,18 @@ def compute_ink_area_metrics(b1: np.ndarray, b2: np.ndarray, a: np.ndarray, thre
     a_mask = compute_ink_mask(a_rgb, threshold=threshold, use_otsu=use_otsu)
 
     def _area(mask: np.ndarray) -> float:
+        """Count pixels included in an ink mask."""
         return float(np.count_nonzero(mask))
 
     def _mm(area_px: float) -> float:
+        """Convert pixel area to square millimetres when a pixel size is known."""
         if pixel_size_mm is None:
             return float(area_px)
         return float(area_px * (pixel_size_mm ** 2))
 
     b1_area = _area(b1_mask)
     def _pct_change(current: float, ref: float) -> float:
+        """Calculate percentage change relative to the reference area."""
         return ((current - ref) / ref) * 100.0 if ref else 0.0
 
     new_b2 = np.logical_and(b2_mask, ~ndimage.binary_dilation(b1_mask, iterations=1))
@@ -259,11 +270,13 @@ def compute_ink_area_metrics(b1: np.ndarray, b2: np.ndarray, a: np.ndarray, thre
 
 
 def compute_edge_softness(b1: np.ndarray, b2: np.ndarray, a: np.ndarray, threshold: float | None = None, pixel_size_mm: float | None = None) -> dict[str, Any]:
+    """Estimate ink edge sharpness, contrast, and width for each image."""
     b1_rgb = _as_rgb_float(b1)
     b2_rgb = _as_rgb_float(b2)
     a_rgb = _as_rgb_float(a)
 
     def _measure(image: np.ndarray) -> dict[str, float]:
+        """Measure lightness gradients around the image's ink boundary."""
         ink = compute_ink_mask(image, threshold=threshold, use_otsu=True)
         lab = rgb2lab(_as_rgb_float(image))
         L = lab[..., 0]
@@ -288,6 +301,7 @@ def compute_edge_softness(b1: np.ndarray, b2: np.ndarray, a: np.ndarray, thresho
 
 
 def compute_halo_profile(before: np.ndarray, after: np.ndarray, threshold: float | None = None, sigma: float = DEFAULT_GAUSSIAN_SIGMA, pixel_size_mm: float | None = None) -> dict[str, Any]:
+    """Summarise colour changes in paper rings at increasing distances from ink."""
     before_rgb = _as_rgb_float(before)
     after_rgb = _as_rgb_float(after)
     before_ink = compute_ink_mask(before_rgb, threshold=threshold, use_otsu=True)

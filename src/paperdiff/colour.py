@@ -7,6 +7,7 @@ __all__ = ["rgb_to_lab", "compute_colour_deltas"]
 
 
 def rgb_to_lab(image: np.ndarray) -> np.ndarray:
+    """Convert clipped grayscale or RGB image data to CIELAB."""
     array = np.asarray(image, dtype=np.float32)
     if array.ndim == 2:
         array = np.repeat(array[..., None], 3, axis=-1)
@@ -16,16 +17,17 @@ def rgb_to_lab(image: np.ndarray) -> np.ndarray:
 
 
 def compute_colour_deltas(reference: np.ndarray, candidate: np.ndarray) -> np.ndarray:
-    ref = np.asarray(reference, dtype=np.float32)
-    cand = np.asarray(candidate, dtype=np.float32)
-    if ref.shape != cand.shape:
-        raise ValueError(f"Image shapes do not match: {ref.shape} vs {cand.shape}")
+    """Calculate per-pixel Euclidean CIELAB differences between matching images."""
+    reference_array = np.asarray(reference, dtype=np.float32)
+    candidate_array = np.asarray(candidate, dtype=np.float32)
+    if reference_array.shape != candidate_array.shape:
+        raise ValueError(f"Image shapes do not match: {reference_array.shape} vs {candidate_array.shape}")
 
-    ref_lab = rgb_to_lab(ref)
-    cand_lab = rgb_to_lab(cand)
+    reference_lab = rgb_to_lab(reference_array)
+    candidate_lab = rgb_to_lab(candidate_array)
     delta = np.sqrt(
-        (ref_lab[..., 0] - cand_lab[..., 0]) ** 2
-        + (ref_lab[..., 1] - cand_lab[..., 1]) ** 2
-        + (ref_lab[..., 2] - cand_lab[..., 2]) ** 2
+        (reference_lab[..., 0] - candidate_lab[..., 0]) ** 2
+        + (reference_lab[..., 1] - candidate_lab[..., 1]) ** 2
+        + (reference_lab[..., 2] - candidate_lab[..., 2]) ** 2
     )
     return delta.astype(np.float32)

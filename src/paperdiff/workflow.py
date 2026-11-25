@@ -48,6 +48,8 @@ def describe_rgb_change(diff,
                         thresholds=(0.005, 0.03, 0.15),
                         labels=("slightly", "moderately", "significantly")):
     """
+    Describe the direction and magnitude of each RGB channel change.
+
     diff       : array-like of 3 values in [-1, 1] (new minus old, per channel)
     thresholds : upper bounds of |diff| for 'no change' / each label except the last
     labels     : one more than... no, one per band above the 'no change' band
@@ -68,6 +70,8 @@ def describe_lab_change(diff,
                         thresholds=(1.0, 2.0, 10.0),
                         labels=("slightly", "moderately", "significantly")):
     """
+    Describe the direction and magnitude of each CIELAB channel change.
+
     diff       : array-like [dL, da, db] (new minus old), in standard CIELAB units
                  (L: 0 to 100, a and b: roughly -128 to +127)
     thresholds : |diff| below the first = no change; each later one starts the next label
@@ -91,6 +95,8 @@ def describe_lab_change(diff,
 
 def delta_e_dict(ref_lab, new_lab):
     """
+    Calculate four CIELAB colour distances between two mean colours.
+
     ref_lab : [L, a, b] mean Lab of the reference (before) image
     new_lab : [L, a, b] mean Lab of the after image
     Returns {"ΔE76": float, "ΔE94": float, "ΔE2000": float, "ΔE CMC": float}
@@ -128,7 +134,7 @@ def rgb_distance_dict(ref_rgb, new_rgb):
 
 
 def _as_rgb(image: np.ndarray) -> np.ndarray:
-    """Convert any image-like input to a float RGB array in the 0..1 range."""
+    """Convert grayscale or RGB image-like input to a floating-point RGB array."""
     array = np.asarray(image, dtype=np.float32)
     if array.ndim == 2:
         array = np.repeat(array[..., None], 3, axis=-1)
@@ -184,62 +190,63 @@ def describe_region_change(metrics: dict[str, float], region_name: str = "region
 
 
 def image_avg(image, mask):
-    ms = np.sum(mask)/3
-    im = image*mask
+    """Return the masked per-channel mean, or zero when the mask is empty."""
+    pixel_count = np.sum(mask)/3
+    masked_image = image*mask
 
-    if ms == 0:
-        return im.reshape(-1, im.shape[-1]).sum(axis=0, dtype=np.float64)*0
+    if pixel_count == 0:
+        return masked_image.reshape(-1, masked_image.shape[-1]).sum(axis=0, dtype=np.float64)*0
     else:
-        return im.reshape(-1, im.shape[-1]).sum(axis=0, dtype=np.float64)/ms
+        return masked_image.reshape(-1, masked_image.shape[-1]).sum(axis=0, dtype=np.float64)/pixel_count
 
 def image_avg_sd(image, mask, check_cancelled: Callable[[], None] | None = None):
     """
     Per-channel mean and standard deviation of `image`
     over the unmasked pixels.
-    image : (H, W, C), e.g. an RGB/Lab image or the difference between two
+    image : (H, W, C), e.g. an RGB/Lab image or the difference between two images
     mask  : (H, W, C), 0/1, all channels equal
     Returns (avg, sd), each of shape (C,). Zeros if the mask is empty.
     
     For individual images:
         avg is the average colour
-        SD is a measure of how uniform the image is (0 = completley uniform, e.g. smooth paper)
+        SD is a measure of how uniform the image is (0 = completely uniform, e.g. smooth paper)
     For a differenced image (A-B):
         avg is the average colour change
-        SD is a measure of how uniformly the image has changed (0 = same change everywhere, e.g. treatment affect is same over whole paper)
+        SD is a measure of how uniformly the image has changed (0 = same change everywhere)
     """
-    n_ch = image.shape[-1]
+    channel_count = image.shape[-1]
     if check_cancelled is not None:
         check_cancelled()
-    ms = np.sum(mask) / n_ch                       # number of unmasked pixels
+    pixel_count = np.sum(mask) / channel_count
 
-    if ms == 0:
-        return np.zeros(n_ch), np.zeros(n_ch)
+    if pixel_count == 0:
+        return np.zeros(channel_count), np.zeros(channel_count)
 
-    flat_im = image.reshape(-1, n_ch)
-    flat_m = np.asarray(mask).reshape(-1, n_ch)
+    flat_image = image.reshape(-1, channel_count)
+    flat_mask = np.asarray(mask).reshape(-1, channel_count)
 
-    avg = (flat_im * flat_m).sum(axis=0, dtype=np.float64) / ms
+    average = (flat_image * flat_mask).sum(axis=0, dtype=np.float64) / pixel_count
     if check_cancelled is not None:
         check_cancelled()
-    sq_dev = ((flat_im - avg) ** 2) * flat_m
+    squared_deviation = ((flat_image - average) ** 2) * flat_mask
     if check_cancelled is not None:
         check_cancelled()
-    sd = np.sqrt(sq_dev.sum(axis=0, dtype=np.float64) / ms)
-    return avg, sd
+    standard_deviation = np.sqrt(squared_deviation.sum(axis=0, dtype=np.float64) / pixel_count)
+    return average, standard_deviation
 
 def grid_averages(image_tiles, mask_tiles):
     """
-    Returns shape (y, x, 3)
+    Calculate masked mean colours for each tile; return shape (y, x, 3).
     """
     y = len(image_tiles)
     x = len(image_tiles[0])
     
-    out = np.empty((y, x, 3))
+    averages = np.empty((y, x, 3))
 
     for j in range(y):
         for i in range(x):
-            out[j, i] = image_avg(image_tiles[j][i], mask_tiles[j][i])
-    return out
+            averages[j, i] = image_avg(image_tiles[j][i], mask_tiles[j][i])
+    return averages
 
 
 def _bounds(n_pixels, n_tiles):
@@ -310,7 +317,7 @@ def upscale_smooth(avgs, height, width, dtype=np.float32):
     return horiz[r0] * (1 - ty) + horiz[r1] * ty
 
 def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks, scale=1.0, delta_e=False, delta_e_fn=delta_e_dict, check_cancelled: Callable[[], None] | None = None):
-
+    """Compare masked before and after colour statistics and optional colour distances."""
     out_data = dict()
     
     b1p_avg, b1p_sd = image_avg_sd(b1,b1_pm,check_cancelled)
@@ -422,7 +429,7 @@ def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks
 
 
 def format_data_out(raw_data, paper_diff_text, ink_diff_text, c0, c1, c2, use_masks, dec_place, delta_e, delta_e_heading="Perceptual Colour Difference (ΔE)"):
-
+    """Format region statistics and colour differences for the results report."""
     format_out = dict()
 
     format_out = {

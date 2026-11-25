@@ -7,6 +7,7 @@ __all__ = ["make_paper_ink_masks"]
 
 
 def make_paper_ink_masks(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Create paper and ink masks using fixed grayscale thresholds."""
     array = np.asarray(image, dtype=np.float32)
     if array.ndim == 2:
         gray = array

@@ -74,6 +74,7 @@ def _as_bool_mask(mask):
 
 
 def _intersection_masks(images, check_cancelled=None):
+    """Intersect the paper and ink masks across all three images."""
     mask_papers = []
     mask_inks = []
     for key in ["B1", "B2", "A"]:
@@ -95,15 +96,15 @@ def _intersection_masks(images, check_cancelled=None):
 
     if check_cancelled is not None:
         check_cancelled()
-    pm = np.logical_and.reduce(mask_papers)
+    paper_intersection = np.logical_and.reduce(mask_papers)
     if check_cancelled is not None:
         check_cancelled()
-    im = np.logical_and.reduce(mask_inks)
-    pm = np.repeat(pm[..., np.newaxis], 3, axis=-1)
+    ink_intersection = np.logical_and.reduce(mask_inks)
+    paper_intersection = np.repeat(paper_intersection[..., np.newaxis], 3, axis=-1)
     if check_cancelled is not None:
         check_cancelled()
-    im = np.repeat(im[..., np.newaxis], 3, axis=-1)
-    return pm, im
+    ink_intersection = np.repeat(ink_intersection[..., np.newaxis], 3, axis=-1)
+    return paper_intersection, ink_intersection
 
 
 class AnalysisCancelled(Exception):
@@ -120,6 +121,7 @@ class ImageLoadingThread(QThread):
     progress = Signal(int, int, str)
 
     def __init__(self, paths, reference_colours, parent=None):
+        """Snapshot paths and initialise loading results and cancellation state."""
         super().__init__(parent)
         self.paths = paths.copy()
         self.reference_colours = reference_colours
@@ -130,10 +132,12 @@ class ImageLoadingThread(QThread):
         self.current_key = ""
 
     def _check_cancelled(self):
+        """Stop the loading worker at a cooperative cancellation checkpoint."""
         if self.cancel_requested.is_set():
             raise ImageLoadingCancelled()
 
     def run(self):
+        """Prepare each image and preview, recording failures for the UI thread."""
         try:
             for index, (key, path) in enumerate(self.paths.items(), start=1):
                 self._check_cancelled()
@@ -162,6 +166,7 @@ class AnalysisThread(QThread):
     progress = Signal(int, int, str)
 
     def __init__(self, images, options, parent=None):
+        """Snapshot analysis options and initialise worker progress and results."""
         super().__init__(parent)
         self.images = images
         self.options = copy(options)
@@ -173,15 +178,18 @@ class AnalysisThread(QThread):
         self.current_task = 0
 
     def _start_task(self, description):
+        """Advance the task counter and report the current analysis stage."""
         self._check_cancelled()
         self.current_task += 1
         self.progress.emit(self.current_task, self.total_tasks, description)
 
     def _check_cancelled(self):
+        """Stop the analysis worker at a cooperative cancellation checkpoint."""
         if self.cancel_requested.is_set():
             raise AnalysisCancelled()
 
     def run(self):
+        """Compute optional intersection masks and run the analysis."""
         try:
             self._check_cancelled()
             if self.use_intersection:
@@ -206,6 +214,7 @@ class ZoomableLabel(QLabel):
     clicked = Signal()
 
     def __init__(self, text=""):
+        """Initialise the preview image, viewport, zoom, and pan state."""
         super().__init__(text)
         self._base_pixmap = QPixmap()
         self._zoom_factor = 1.0
@@ -216,12 +225,15 @@ class ZoomableLabel(QLabel):
         self.setMinimumSize(120, 80)
 
     def sizeHint(self):
+        """Suggest the configured viewport size to the layout."""
         return self._fixed_viewport if self._fixed_viewport.isValid() else QSize(320, 240)
 
     def minimumSizeHint(self):
+        """Return the smallest suggested preview size."""
         return QSize(120, 80)
 
     def _clamp_pan(self, viewport: QSize, scaled_width: int, scaled_height: int, pan_x: float | None = None, pan_y: float | None = None):
+        """Keep the scaled image centred or within the viewport edges."""
         if pan_x is None:
             pan_x = self._pan_x
         if pan_y is None:
@@ -240,6 +252,7 @@ class ZoomableLabel(QLabel):
         return pan_x, pan_y
 
     def resizeEvent(self, event):
+        """Update the viewport and redraw the image after resizing."""
         super().resizeEvent(event)
         self._fixed_viewport = self.size()
         if self._base_pixmap is not None and not self._base_pixmap.isNull():
@@ -248,6 +261,7 @@ class ZoomableLabel(QLabel):
             self._refresh_zoomed_pixmap()
 
     def setPixmap(self, pixmap, preserve_zoom: bool = False):
+        """Set the source image, optionally retaining its current zoom and pan."""
         self._base_pixmap = pixmap if pixmap is not None else QPixmap()
         if preserve_zoom:
             self._auto_fit_zoom = False
@@ -259,6 +273,7 @@ class ZoomableLabel(QLabel):
         self._refresh_zoomed_pixmap()
 
     def setFixedViewport(self, width: int, height: int):
+        """Set the viewport dimensions and fit the image to them."""
         self._fixed_viewport = QSize(width, height)
         self._apply_fit_zoom()
         self._refresh_zoomed_pixmap()
@@ -312,6 +327,7 @@ class ZoomableLabel(QLabel):
         return canvas
 
     def _refresh_zoomed_pixmap(self):
+        """Render the source pixmap at the current zoom and pan."""
         if self._base_pixmap is None or self._base_pixmap.isNull():
             super().setPixmap(QPixmap())
             return
@@ -326,6 +342,7 @@ class ZoomableLabel(QLabel):
         super().setPixmap(self._render_centered_pixmap(self._base_pixmap, viewport))
 
     def wheelEvent(self, event):
+        """Zoom around the mouse cursor while keeping the image in bounds."""
         if self._base_pixmap is None or self._base_pixmap.isNull():
             return
 
@@ -366,19 +383,17 @@ class ZoomableLabel(QLabel):
         event.accept()
 
     def mousePressEvent(self, event):
+        """Emit a click before passing the mouse event to the label."""
         self.clicked.emit()
         super().mousePressEvent(event)
 
     def clear(self):
+        """Clear the source image and reset zoom and pan."""
         self._base_pixmap = QPixmap()
         self._zoom_factor = 1.0
         self._pan_x = 0.0
         self._pan_y = 0.0
         super().clear()
-
-    def mousePressEvent(self, event):
-        self.clicked.emit()
-        super().mousePressEvent(event)
 
 
 class ClickableLabel(ZoomableLabel):
@@ -389,6 +404,7 @@ class ClickableLabel(ZoomableLabel):
 
 class AnalysisTabBar(QTabBar):
     def initStyleOption(self, option: QStyleOptionTab, tab_index: int):
+        """Suppress hover styling for disabled tabs."""
         super().initStyleOption(option, tab_index)
         if not self.isTabEnabled(tab_index):
             option.state &= ~QStyle.StateFlag.State_MouseOver
@@ -398,6 +414,7 @@ class MainWindow(QMainWindow):
     """The main window containing the analysis workflow."""
 
     def __init__(self):
+        """Build the workflow tabs and initialise application state."""
         super().__init__()
         self.setWindowTitle("Paper Conservation Analysis")
         self.setMinimumSize(0, 0)
@@ -467,6 +484,7 @@ class MainWindow(QMainWindow):
         self._refresh_preview_box_sizes()
 
     def _disabled_tab_reason(self, tab):
+        """Describe why a workflow tab is unavailable."""
         if self._loading_thread is not None:
             return "image loading is in progress"
         if self._analysis_thread is not None:
@@ -478,6 +496,7 @@ class MainWindow(QMainWindow):
         return "images must be loaded first"
 
     def _disabled_control_reason(self, widget):
+        """Describe the current prerequisite for a disabled control."""
         if widget is self.normal_map_radio:
             return "normal map analysis is not yet available"
         if widget is self.cancel_load_button or widget is self.cancel_analysis_button:
@@ -520,6 +539,7 @@ class MainWindow(QMainWindow):
         return "unavailable"
 
     def _refresh_disabled_tooltips(self):
+        """Append or remove disabled-state explanations on controls and tabs."""
         if not hasattr(self, "_base_control_tooltips"):
             return
         for tab, tooltip in self._base_tab_tooltips.items():
@@ -533,10 +553,12 @@ class MainWindow(QMainWindow):
             widget.setToolTip(tooltip)
 
     def resizeEvent(self, event):
+        """Resize preview boxes when the main window changes size."""
         super().resizeEvent(event)
         self._refresh_preview_box_sizes()
 
     def closeEvent(self, event):
+        """Defer closing until any loading or analysis worker has finished."""
         if self._loading_thread is not None:
             self._close_after_loading = True
             self.load_status_label.setText("Loading is finishing; the window will close when it is done.")
@@ -692,6 +714,7 @@ class MainWindow(QMainWindow):
             return f"Unknown size • {suffix} • {self._format_file_size(size)}"
 
     def _set_preview_text(self, label: QLabel, text: str):
+        """Replace a preview pixmap with text."""
         label.setText(text)
         label.setPixmap(QPixmap())
 
@@ -787,6 +810,7 @@ class MainWindow(QMainWindow):
         self._refresh_disabled_tooltips()
 
     def cancel_loading(self):
+        """Request cooperative cancellation of the current image load."""
         if self._loading_thread is None:
             return
         self._loading_thread.cancel_requested.set()
@@ -797,6 +821,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int, str)
     def _load_progress(self, current, total, key):
+        """Display the loading worker's current image and completed percentage."""
         if self._loading_thread is not None and self._loading_thread.cancel_requested.is_set():
             return
         self.load_progress_bar.setValue((current - 1) * 100 // total)
@@ -804,6 +829,7 @@ class MainWindow(QMainWindow):
         self.load_status_label.setText(f"Loading {self.image_key_labels[key]} ({current}/{total}){suffix}")
 
     def _load_finished(self):
+        """Publish a successful image set or restore controls after cancellation or failure."""
         thread = self._loading_thread
         self._loading_thread = None
         self.load_image_type_group.setEnabled(True)
@@ -1025,6 +1051,7 @@ class MainWindow(QMainWindow):
         self.alignment_preview.setPixmap(pixmap, preserve_zoom=True)
 
     def _cycle_alignment_image(self):
+        """Advance the alignment preview to the next image."""
         order = ["B1", "B2", "A"]
         current_index = order.index(self.current_alignment_view)
         self.current_alignment_view = order[(current_index + 1) % len(order)]
@@ -1032,6 +1059,7 @@ class MainWindow(QMainWindow):
         self._display_alignment_image()
 
     def _images_have_identical_resolution(self):
+        """Check whether all loaded images have matching dimensions."""
         sizes = []
         for key in ["B1", "B2", "A"]:
             image_data = self.images[key]
@@ -1045,6 +1073,7 @@ class MainWindow(QMainWindow):
         return len(set(sizes)) == 1
 
     def _update_alignment_mode_availability(self):
+        """Allow aligned mode only when the image resolutions match."""
         if not hasattr(self, "alignment_checkbox"):
             return
 
@@ -1054,17 +1083,19 @@ class MainWindow(QMainWindow):
             self.alignment_checkbox.setChecked(False)
 
     def _update_alignment_buttons(self):
+        """Mark the currently displayed image in the alignment selector."""
         for key, button in self.alignment_buttons.items():
             button.setChecked(key == self.current_alignment_view)
 
     def _reset_alignment_zoom(self):
+        """Fit and centre the alignment preview image."""
         if hasattr(self, "alignment_preview") and self.alignment_preview._base_pixmap is not None and not self.alignment_preview._base_pixmap.isNull():
             self.alignment_preview._auto_fit_zoom = True
             self.alignment_preview._apply_fit_zoom()
             self.alignment_preview._refresh_zoomed_pixmap()
 
     def _create_check_alignment_tab(self):
-        """Tab 3: visually inspect the alignment by switching the view between B1/B2/A."""
+        """Create the tab for visually inspecting alignment across B1, B2, and A."""
         page = QWidget()
         page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         layout = QVBoxLayout(page)
@@ -1162,18 +1193,22 @@ class MainWindow(QMainWindow):
         return page
 
     def _set_alignment_view(self, key: str):
+        """Select an image for the alignment preview."""
         self.current_alignment_view = key
         self._update_alignment_buttons()
         self._display_alignment_image()
 
     def _set_alignment_mode(self, mode: str):
+        """Select the alignment preview's image or mask display mode."""
         self.alignment_display_mode = mode
         self._display_alignment_image()
 
     def _refresh_alignment_preview(self):
+        """Redraw the current alignment preview."""
         self._display_alignment_image()
 
     def _choose_mask_overlay_colour(self):
+        """Choose the colour used to display pixels outside a mask."""
         colour = QColorDialog.getColor(self.mask_overlay_colour, self, "Select masked area colour")
         if colour.isValid():
             self.mask_overlay_colour = colour
@@ -1181,6 +1216,7 @@ class MainWindow(QMainWindow):
             self._display_alignment_image()
 
     def _set_mask_mode(self, mode: str):
+        """Select a mask-generation mode and update its controls."""
         self.mask_mode = mode
         use_mask_enabled = self.use_mask_checkbox.isChecked() if hasattr(self, "use_mask_checkbox") else True
         reference_mode_enabled = use_mask_enabled and mode == "reference_colour"
@@ -1223,6 +1259,7 @@ class MainWindow(QMainWindow):
         self._refresh_disabled_tooltips()
 
     def _set_mask_reference_colour(self, key: str, region: str):
+        """Choose a paper or ink reference colour for one image."""
         image_data = self.images[key]
         colour = QColorDialog.getColor(image_data.reference_colours[region], self, f"Select {region} colour for {key}")
         if not colour.isValid():
@@ -1233,6 +1270,7 @@ class MainWindow(QMainWindow):
         self._update_reference_colour_buttons()
 
     def _change_all_reference_colours(self, region: str):
+        """Choose one reference colour for the same region in all images."""
         representative = self.images["B1"].reference_colours[region]
         colour = QColorDialog.getColor(representative, self, f"Select all {region} colours")
         if not colour.isValid():
@@ -1245,6 +1283,7 @@ class MainWindow(QMainWindow):
         self._update_reference_colour_buttons()
 
     def _update_reference_colour_buttons(self):
+        """Refresh reference-colour button labels and swatches."""
         for key in ["B1", "B2", "A"]:
             paper_colour = self.images[key].reference_colours["paper"]
             ink_colour = self.images[key].reference_colours["ink"]
@@ -1307,6 +1346,7 @@ class MainWindow(QMainWindow):
         self._display_alignment_image()
 
     def _import_mask_for_key(self, key: str):
+        """Prompt for a mask file and import it for the selected image."""
         image_data = self.images[key]
         if not self._ensure_image_loaded_for_key(key):
             QMessageBox.warning(self, "Missing image", f"Load {key} before importing a mask.")
@@ -1323,6 +1363,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Mask import failed", f"Unable to import the mask for {key}:\n{exc}")
 
     def _import_mask_from_path(self, key: str, path: str):
+        """Load a mask from a path and refresh the affected previews."""
         image_data = self.images[key]
         image_data.import_mask(path)
         self._display_mask_preview(
@@ -1334,6 +1375,7 @@ class MainWindow(QMainWindow):
         self._display_alignment_image()
 
     def _auto_import_masks(self):
+        """Import available masks from configured export paths and report outcomes."""
         imported = []
         missing = []
         errors = []
@@ -1360,6 +1402,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Auto-import masks", "\n".join(details))
 
     def _set_mask_export_path_for_key(self, key: str):
+        """Choose and validate the PNG export destination for one image."""
         path, _ = QFileDialog.getSaveFileName(
             self, f"Set mask export path for {key}", self.mask_export_paths[key],
             "PNG images (*.png)", options=QFileDialog.Option.DontConfirmOverwrite,
@@ -1375,6 +1418,7 @@ class MainWindow(QMainWindow):
         self.mask_export_path_fields[key].setText(path)
 
     def _export_mask_for_key(self, key: str, *, notify: bool = True):
+        """Export one mask after confirming replacement of an existing file."""
         path = self.mask_export_paths[key]
         if not path:
             QMessageBox.warning(self, "Missing export path", f"Load {key} before exporting a mask.")
@@ -1394,6 +1438,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _export_all_masks(self):
+        """Export masks to distinct configured paths and summarise the outcomes."""
         paths = [os.path.normcase(os.path.realpath(path)) for path in self.mask_export_paths.values() if path]
         if len(set(paths)) != len(paths):
             QMessageBox.warning(self, "Mask export failed", "Choose a different export path for each image.")
@@ -1411,6 +1456,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Export all masks", "\n".join(details))
 
     def _update_mask_file_controls(self):
+        """Enable mask import and export controls when masking is enabled."""
         if not hasattr(self, "mask_export_buttons"):
             return
         enabled = self.use_mask_checkbox.isChecked()
@@ -1423,6 +1469,7 @@ class MainWindow(QMainWindow):
         self._refresh_disabled_tooltips()
 
     def _update_mask_generation_button_text(self):
+        """Reset the per-image mask generation button labels."""
         if not hasattr(self, "mask_generate_buttons"):
             return
 
@@ -1496,7 +1543,7 @@ class MainWindow(QMainWindow):
         self._refresh_disabled_tooltips()
 
     def _create_mask_tab(self):
-        """Tab 3: prepare and preview masks used for the paper and ink analysis."""
+        """Create the tab for preparing and previewing paper and ink masks."""
         page = QWidget()
         page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         layout = QVBoxLayout(page)
@@ -2011,6 +2058,7 @@ class MainWindow(QMainWindow):
         self._refresh_disabled_tooltips()
 
     def cancel_analysis(self):
+        """Request cooperative cancellation of the current analysis."""
         if self._analysis_thread is None:
             return
         self._analysis_thread.cancel_requested.set()
@@ -2021,6 +2069,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int, str)
     def _analysis_progress(self, task, total, description):
+        """Display the current analysis stage and completed percentage."""
         if self._analysis_thread is not None and self._analysis_thread.cancel_requested.is_set():
             return
         self.analysis_progress_bar.setValue((task - 1) * 100 // total)
@@ -2028,6 +2077,7 @@ class MainWindow(QMainWindow):
         self.analysis_progress_label.setText(f"Task {task}/{total}: {description}{suffix}")
 
     def _analysis_finished(self):
+        """Publish successful results and restore controls after the worker finishes."""
         thread = self._analysis_thread
         self._analysis_thread = None
         self.analysis_settings_group.setEnabled(True)

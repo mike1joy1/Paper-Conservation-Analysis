@@ -11,6 +11,7 @@
 
 ## UI
 - Export results (csv?)
+- Export heatmaps (png?)
 
 ## Batch
 - Batch mode plan - folder structure for holistic cross compare or only file name match

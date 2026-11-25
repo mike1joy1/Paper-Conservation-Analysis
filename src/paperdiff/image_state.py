@@ -35,6 +35,7 @@ class analysis_options:
     """Container for all analysis option settings used by the UI."""
 
     def __init__(self):
+        """Initialise analysis settings and intersection-mask state."""
         self.show_analysis_options = False
         self.show_image_data = False
         
@@ -53,6 +54,7 @@ class analysis_options:
         self.int_ink_mask = None
 
     def to_dict(self):
+        """Return the reportable analysis settings as a dictionary."""
         details = {
             "show_analysis_options": self.show_analysis_options,
             "show_image_data": self.show_image_data,
@@ -69,6 +71,7 @@ class analysis_options:
         return details
 
     def __str__(self) -> str:
+        """Describe the current analysis settings for display or debugging."""
         details = {
             "show_analysis_options": self.show_analysis_options,
             "show_image_data": self.show_image_data,
@@ -85,6 +88,7 @@ class analysis_options:
         return f"analysis_options({details})"
 
     def sync_from_ui(self, **values):
+        """Update known settings from UI values."""
         for key, value in values.items():
             if hasattr(self, key):
                 setattr(self, key, value)
@@ -94,6 +98,7 @@ class image_data_colour:
     """Container for a single image and the related pixel and mask state."""
 
     def __init__(self, key: str, file_path: str | None = None):
+        """Initialise an image's pixels, masks, and reference colours."""
         self.key = key
         self.file_path = file_path
         self.pixels: dict[str, np.ndarray] = {}
@@ -107,6 +112,7 @@ class image_data_colour:
         self._reset_masks_to_full()
 
     def __str__(self) -> str:
+        """Summarise image array shapes, masks, and reference colours."""
         pixels_summary = {name: np.asarray(value).shape if value is not None else None for name, value in self.pixels.items()}
         masks_summary = {name: np.asarray(value).shape if value is not None else None for name, value in self.masks.items()}
         details = {
@@ -122,6 +128,7 @@ class image_data_colour:
 
     @staticmethod
     def _mask_to_rgb(mask: np.ndarray | None) -> np.ndarray | None:
+        """Convert a mask to a floating-point three-channel representation."""
         if mask is None:
             return None
         boolean_mask = np.asarray(mask, dtype=bool)
@@ -132,6 +139,7 @@ class image_data_colour:
         return boolean_mask.astype(np.float32)
 
     def _reset_masks_to_full(self, check_cancelled: Callable[[], None] | None = None):
+        """Reset paper and ink masks to include every loaded pixel."""
         if "rgb" in self.pixels:
             shape = np.asarray(self.pixels["rgb"]).shape[:2]
         else:
@@ -160,9 +168,11 @@ class image_data_colour:
         self.masks_exists = {"paper": False, "ink": False}
 
     def clear_masks(self):
+        """Remove generated masks and restore full-image masks."""
         self._reset_masks_to_full()
 
     def get_pixels(self, colourspace: str):
+        """Return pixels in the requested colour space, generating LAB if needed."""
         if colourspace in self.pixels:
             return np.asarray(self.pixels[colourspace], dtype=np.float32)
         if colourspace == "lab":
@@ -170,6 +180,7 @@ class image_data_colour:
         raise KeyError(f"Unknown colourspace '{colourspace}'")
 
     def set_mask(self, name: str, mask: np.ndarray):
+        """Store a paper or ink mask in three-channel form."""
         if name not in {"paper", "ink"}:
             raise ValueError(f"Unsupported mask '{name}'")
         array = self._mask_to_rgb(mask)
@@ -177,12 +188,14 @@ class image_data_colour:
         self.masks_exists[name] = True
 
     def export_mask(self, path: str):
+        """Save the current paper and ink masks as a colour-coded PNG."""
         if self.pixels.get("rgb") is None:
             raise ValueError("Load an image before exporting its mask.")
         image = mask_to_colour_image(self.masks["paper"], self.masks["ink"])
         Image.fromarray(image).save(path, format="PNG")
 
     def import_mask(self, path: str):
+        """Import a matching-resolution colour mask and replace both region masks."""
         rgb = self.get_pixels("rgb")
         with Image.open(path) as image:
             if image.size != (rgb.shape[1], rgb.shape[0]):
@@ -203,6 +216,7 @@ class image_data_colour:
         self.masks_exists = {"paper": True, "ink": True}
 
     def load_from_path(self, path: str, check_cancelled: Callable[[], None] | None = None):
+        """Load RGB pixels, prepare LAB pixels, and reset masks for an image."""
         self.file_path = path
         if check_cancelled is not None:
             check_cancelled()
@@ -226,6 +240,7 @@ class image_data_colour:
         return self.pixels["rgb"]
 
     def generate_lab_pixels(self, check_cancelled: Callable[[], None] | None = None):
+        """Convert stored RGB pixels to CIELAB and cache the result."""
         if "rgb" not in self.pixels:
             return None
 
@@ -264,6 +279,7 @@ class image_data_colour:
         return lab
 
     def generate_masks(self, mode: str, threshold: int = 140, reference_weight: float = 0.5, border_pixels: int = 2):
+        """Classify paper and ink pixels and exclude the requested boundary width."""
         rgb_array = self.get_pixels("rgb")
         if rgb_array is None:
             return None, None, None
