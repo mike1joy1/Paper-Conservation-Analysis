@@ -316,12 +316,24 @@ def upscale_smooth(avgs, height, width, dtype=np.float32):
     # Then vertically: (height, width, 3)
     return horiz[r0] * (1 - ty) + horiz[r1] * ty
 
-def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks, scale=1.0, delta_e=False, delta_e_fn=delta_e_dict, check_cancelled: Callable[[], None] | None = None):
+def compare_b1_b2_a(
+    b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks,
+    scale=1.0, delta_e=False, delta_e_fn=delta_e_dict,
+    check_cancelled: Callable[[], None] | None = None,
+    progress: Callable[[str], None] | None = None,
+    colour_space: str = "",
+):
     """Compare masked before and after colour statistics and optional colour distances."""
     out_data = dict()
     
+    if progress is not None:
+        progress(f"Analysing {colour_space} paper: Before Image 1")
     b1p_avg, b1p_sd = image_avg_sd(b1,b1_pm,check_cancelled)
+    if progress is not None:
+        progress(f"Analysing {colour_space} paper: Before Image 2")
     b2p_avg, b2p_sd = image_avg_sd(b2,b2_pm,check_cancelled)
+    if progress is not None:
+        progress(f"Analysing {colour_space} paper: After Image")
     ap_avg,  ap_sd  = image_avg_sd(a,a_pm,check_cancelled)
 
     if delta_e:
@@ -373,8 +385,14 @@ def compare_b1_b2_a(b1, b2, a, b1_pm, b2_pm, a_pm, b1_im, b2_im, a_im, use_masks
 
 
     if use_masks:
+        if progress is not None:
+            progress(f"Analysing {colour_space} ink: Before Image 1")
         b1i_avg, b1i_sd = image_avg_sd(b1,b1_im,check_cancelled)
+        if progress is not None:
+            progress(f"Analysing {colour_space} ink: Before Image 2")
         b2i_avg, b2i_sd = image_avg_sd(b2,b2_im,check_cancelled)
+        if progress is not None:
+            progress(f"Analysing {colour_space} ink: After Image")
         ai_avg,  ai_sd  = image_avg_sd(a,a_im,check_cancelled)
 
         if delta_e:
@@ -629,6 +647,8 @@ def image_analysis_b1_b2_a(
 
     if check_cancelled is not None:
         check_cancelled()
+    if progress is not None:
+        progress("Summarising mask data")
     # mask test
     total_pixels = {
         "b1": np.prod(b1.pixels.get("rgb").shape[:2]),
@@ -663,6 +683,8 @@ def image_analysis_b1_b2_a(
     }
 
     if op.show_image_data:
+        if progress is not None:
+            progress("Compiling image data")
         results["Image Data"] = {
             "Before 1": {
                 "Image Array Shape": b1.get_pixels("rgb").shape,
@@ -729,7 +751,7 @@ def image_analysis_b1_b2_a(
         results[rgb_mean_heading] = {"(Scale": f"{0.0:.{dec_place}f} to {rgb_scale:.{dec_place}f})"}
 
         if op.mean_comparison:
-            raw_data_rgb = compare_b1_b2_a(rgb["b1"], rgb["b2"], rgb["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=rgb_scale, delta_e=True, delta_e_fn=rgb_distance_dict, check_cancelled=check_cancelled)
+            raw_data_rgb = compare_b1_b2_a(rgb["b1"], rgb["b2"], rgb["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=rgb_scale, delta_e=True, delta_e_fn=rgb_distance_dict, check_cancelled=check_cancelled, progress=progress, colour_space="RGB")
             
             rgb_paper_diff_text = describe_rgb_change(raw_data_rgb["paper"]["change"]["avg"]/rgb_scale)
             if op.use_masks:
@@ -810,7 +832,7 @@ def image_analysis_b1_b2_a(
 
         # mean comparison
         if op.mean_comparison:
-            raw_data_lab = compare_b1_b2_a(lab["b1"], lab["b2"], lab["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=lab_scale, delta_e=True, check_cancelled=check_cancelled)
+            raw_data_lab = compare_b1_b2_a(lab["b1"], lab["b2"], lab["a"], paper_mask["b1"], paper_mask["b2"], paper_mask["a"], ink_mask["b1"], ink_mask["b2"], ink_mask["a"], op.use_masks, scale=lab_scale, delta_e=True, check_cancelled=check_cancelled, progress=progress, colour_space="CIELAB")
             
             lab_paper_diff_text = describe_lab_change(raw_data_lab["paper"]["change"]["avg"]/lab_scale)
             if op.use_masks:

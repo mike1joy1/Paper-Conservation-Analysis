@@ -118,7 +118,7 @@ class ImageLoadingCancelled(Exception):
 class ImageLoadingThread(QThread):
     """Load a complete image set without accessing UI widgets."""
 
-    progress = Signal(int, int, str)
+    progress = Signal(int, int, str, str)
 
     def __init__(self, paths, reference_colours, parent=None):
         """Snapshot paths and initialise loading results and cancellation state."""
@@ -130,6 +130,14 @@ class ImageLoadingThread(QThread):
         self.previews = {}
         self.error = None
         self.current_key = ""
+        self.current_task = 0
+        self.total_tasks = len(self.paths) * 5
+
+    def _start_task(self, description):
+        """Report the next loading step for the current image."""
+        self._check_cancelled()
+        self.current_task += 1
+        self.progress.emit(self.current_task, self.total_tasks, self.current_key, description)
 
     def _check_cancelled(self):
         """Stop the loading worker at a cooperative cancellation checkpoint."""
@@ -139,14 +147,15 @@ class ImageLoadingThread(QThread):
     def run(self):
         """Prepare each image and preview, recording failures for the UI thread."""
         try:
-            for index, (key, path) in enumerate(self.paths.items(), start=1):
+            for key, path in self.paths.items():
                 self._check_cancelled()
                 self.current_key = key
-                self.progress.emit(index, len(self.paths), key)
+                self._start_task("Loading image")
                 image_data = image_data_colour(key)
                 image_data.reference_colours = self.reference_colours[key]
-                image_data.load_from_path(path, check_cancelled=self._check_cancelled)
+                image_data.load_from_path(path, check_cancelled=self._check_cancelled, progress=self._start_task)
                 self._check_cancelled()
+                self._start_task("Preparing preview")
                 rgb = np.ascontiguousarray((np.clip(image_data.get_pixels("rgb"), 0.0, 1.0) * 255.0).astype(np.uint8))
                 self._check_cancelled()
                 h, w, channels = rgb.shape
@@ -174,7 +183,11 @@ class AnalysisThread(QThread):
         self.error = None
         self.cancel_requested = Event()
         self.use_intersection = self.options.images_aligned and self.options.use_masks and self.options.intersection_mask
-        self.total_tasks = 1 + int(self.options.rgb_comparison) + int(self.options.lab_comparison) + int(self.use_intersection)
+        colour_tasks = 1 + (3 * (1 + int(self.options.use_masks)) if self.options.mean_comparison else 0)
+        self.total_tasks = (
+            2 + int(self.options.show_image_data) + int(self.use_intersection)
+            + colour_tasks * (int(self.options.rgb_comparison) + int(self.options.lab_comparison))
+        )
         self.current_task = 0
 
     def _start_task(self, description):
@@ -434,6 +447,7 @@ class MainWindow(QMainWindow):
         self._close_after_loading = False
         self._analysis_thread = None
         self._close_after_analysis = False
+        self._alignment_tab_visited = False
 
         self.tab_widget = QTabWidget()
         original_tab_bar = self.tab_widget.tabBar()
@@ -459,6 +473,7 @@ class MainWindow(QMainWindow):
         self.tab_widget.addTab(self.analysis_options_tab, "4) Analysis")
         self.tab_widget.addTab(self.results_tab, "5) Results data")
         self.tab_widget.addTab(self.image_results_tab, "6) Image results")
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         self._base_tab_tooltips = dict((
             (self.load_tab, "Select, preview, and load the before and after images."),
@@ -819,14 +834,14 @@ class MainWindow(QMainWindow):
         self.load_status_label.setText("Cancelling image loading...")
         self._refresh_disabled_tooltips()
 
-    @Slot(int, int, str)
-    def _load_progress(self, current, total, key):
-        """Display the loading worker's current image and completed percentage."""
+    @Slot(int, int, str, str)
+    def _load_progress(self, current, total, key, description):
+        """Display the current image and estimated midpoint progress."""
         if self._loading_thread is not None and self._loading_thread.cancel_requested.is_set():
             return
-        self.load_progress_bar.setValue((current - 1) * 100 // total)
+        self.load_progress_bar.setValue(((2 * current - 1) * 100 + total) // (2 * total))
         suffix = " (closing when finished)" if self._close_after_loading else ""
-        self.load_status_label.setText(f"Loading {self.image_key_labels[key]} ({current}/{total}){suffix}")
+        self.load_status_label.setText(f"Task {current}/{total}: {description} - {self.image_key_labels[key]}{suffix}")
 
     def _load_finished(self):
         """Publish a successful image set or restore controls after cancellation or failure."""
@@ -1093,6 +1108,12 @@ class MainWindow(QMainWindow):
             self.alignment_preview._auto_fit_zoom = True
             self.alignment_preview._apply_fit_zoom()
             self.alignment_preview._refresh_zoomed_pixmap()
+
+    def _on_tab_changed(self, index: int):
+        """Fit the alignment image on the first visit to its tab."""
+        if not self._alignment_tab_visited and self.tab_widget.widget(index) is self.check_alignment_tab:
+            self._alignment_tab_visited = True
+            self._reset_alignment_zoom()
 
     def _create_check_alignment_tab(self):
         """Create the tab for visually inspecting alignment across B1, B2, and A."""
@@ -2069,10 +2090,10 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int, str)
     def _analysis_progress(self, task, total, description):
-        """Display the current analysis stage and completed percentage."""
+        """Display the current analysis stage and estimated midpoint progress."""
         if self._analysis_thread is not None and self._analysis_thread.cancel_requested.is_set():
             return
-        self.analysis_progress_bar.setValue((task - 1) * 100 // total)
+        self.analysis_progress_bar.setValue(((2 * task - 1) * 100 + total) // (2 * total))
         suffix = " (closing when finished)" if self._close_after_analysis else ""
         self.analysis_progress_label.setText(f"Task {task}/{total}: {description}{suffix}")
 

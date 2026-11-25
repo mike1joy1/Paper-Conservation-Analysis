@@ -73,8 +73,8 @@ On the Mask tab, enable **Use mask** to import or export masks. If no mask has b
 
 **Export all masks** saves each image's mask to its configured path, prompting before overwriting. **Auto-import masks** loads files found at those paths and reports missing or invalid masks.
 
-Image loading runs in the background. The Load images tab shows progress by image; **Cancel loading** stops between loading steps and preserves the previously loaded data. Individual decoding or array operations cannot be interrupted mid-step. Closing the window waits for loading to finish.
+Image loading runs in the background. The Load images tab estimates progress at the midpoint of each loading step, including decoding, RGB preparation, CIELAB conversion, mask initialisation, and preview preparation. **Cancel loading** stops between loading steps and preserves the previously loaded data. Individual decoding or array operations cannot be interrupted mid-step. Closing the window waits for loading to finish.
 
-Analysis runs in the background. The Analysis tab shows the current task and progress as a percentage of completed tasks; tasks may take different amounts of time. Image and analysis settings cannot be changed until it finishes. Closing the window during analysis waits for the current run to finish.
+Analysis runs in the background. The Analysis tab shows the current task and estimates progress at each task's midpoint, including individual image and region comparisons; tasks may take different amounts of time. Image and analysis settings cannot be changed until it finishes. Closing the window during analysis waits for the current run to finish.
 
 Use **Cancel analysis** to stop a run. Cancellation takes effect between calculation steps, and the previous report is preserved.

@@ -215,7 +215,10 @@ class image_data_colour:
         self.mask_border = border
         self.masks_exists = {"paper": True, "ink": True}
 
-    def load_from_path(self, path: str, check_cancelled: Callable[[], None] | None = None):
+    def load_from_path(
+        self, path: str, check_cancelled: Callable[[], None] | None = None,
+        progress: Callable[[str], None] | None = None,
+    ):
         """Load RGB pixels, prepare LAB pixels, and reset masks for an image."""
         self.file_path = path
         if check_cancelled is not None:
@@ -223,6 +226,8 @@ class image_data_colour:
         image = load_image(path)
         if check_cancelled is not None:
             check_cancelled()
+        if progress is not None:
+            progress("Preparing RGB pixels")
         rgb = np.asarray(image, dtype=np.float32)
         if rgb.ndim == 2:
             rgb = np.repeat(rgb[..., None], 3, axis=-1)
@@ -233,7 +238,13 @@ class image_data_colour:
         self.pixels["rgb"] = np.clip(rgb, 0.0, 1.0)
         if check_cancelled is not None:
             check_cancelled()
+        if progress is not None:
+            progress("Converting to CIELAB")
         self.generate_lab_pixels(check_cancelled=check_cancelled)
+        if check_cancelled is not None:
+            check_cancelled()
+        if progress is not None:
+            progress("Initialising masks")
         self._reset_masks_to_full(check_cancelled=check_cancelled)
         if check_cancelled is not None:
             check_cancelled()

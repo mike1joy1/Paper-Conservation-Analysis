@@ -63,6 +63,43 @@ def test_all_app_controls_have_tooltips(window):
     assert "not yet available" in window.heatmap_grid_slider_y.toolTip()
 
 
+def test_alignment_zoom_is_reset_only_on_first_visit(window, monkeypatch, image_paths):
+    for key, path in image_paths.items():
+        select_image(window, monkeypatch, key, path)
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    window.show()
+    preview = window.alignment_preview
+    preview._auto_fit_zoom = False
+    preview._zoom_factor = 1.0
+    resets = []
+    original_reset = window._reset_alignment_zoom
+
+    def record_reset():
+        resets.append(True)
+        original_reset()
+
+    monkeypatch.setattr(window, "_reset_alignment_zoom", record_reset)
+    window.tab_widget.setCurrentWidget(window.check_alignment_tab)
+    assert resets == [True]
+    assert preview._auto_fit_zoom
+    assert preview._zoom_factor == preview._fit_zoom_for_viewport()
+
+    window.tab_widget.setCurrentWidget(window.mask_tab)
+    preview._auto_fit_zoom = False
+    preview._zoom_factor = 2.0
+    window.tab_widget.setCurrentWidget(window.check_alignment_tab)
+    assert resets == [True]
+    assert not preview._auto_fit_zoom
+    assert preview._zoom_factor == 2.0
+
+    window.tab_widget.setCurrentWidget(window.load_tab)
+    window.load_images_button.click()
+    wait_until(lambda: window._loading_thread is None)
+    window.tab_widget.setCurrentWidget(window.check_alignment_tab)
+    assert resets == [True]
+
+
 def test_tab_tooltips_are_shown_even_when_tabs_are_disabled(window):
     window.show()
     tab_bar = window.tab_widget.tabBar()
@@ -441,9 +478,9 @@ def test_select_previews_then_loads_all_images(window, monkeypatch, image_paths,
     original_load = image_data_colour.load_from_path
     loaded_paths = []
 
-    def record_load(image, path, check_cancelled=None):
+    def record_load(image, path, check_cancelled=None, progress=None):
         loaded_paths.append(path)
-        return original_load(image, path, check_cancelled=check_cancelled)
+        return original_load(image, path, check_cancelled=check_cancelled, progress=progress)
 
     monkeypatch.setattr(image_data_colour, "load_from_path", record_load)
     for key, path in image_paths.items():
@@ -523,10 +560,10 @@ def test_failed_load_keeps_previous_set_and_blocks_downstream(window, monkeypatc
     original_load = image_data_colour.load_from_path
     errors = []
 
-    def fail_second(image, path, check_cancelled=None):
+    def fail_second(image, path, check_cancelled=None, progress=None):
         if image.key == "B2":
             raise OSError("test failure")
-        return original_load(image, path, check_cancelled=check_cancelled)
+        return original_load(image, path, check_cancelled=check_cancelled, progress=progress)
 
     monkeypatch.setattr(image_data_colour, "load_from_path", fail_second)
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args))
@@ -559,18 +596,19 @@ def test_loading_progress_and_responsive_ui(window, monkeypatch, image_paths):
     calls = []
     original_load = image_data_colour.load_from_path
 
-    def paused_load(image, path, check_cancelled=None):
+    def paused_load(image, path, check_cancelled=None, progress=None):
         calls.append(threading.get_ident())
         if not permits.acquire(timeout=5):
             raise RuntimeError("Timed out waiting for test")
-        return original_load(image, path, check_cancelled=check_cancelled)
+        return original_load(image, path, check_cancelled=check_cancelled, progress=progress)
 
     monkeypatch.setattr(image_data_colour, "load_from_path", paused_load)
     window.load_images_button.click()
     try:
         for task, key in enumerate(("B1", "B2", "A"), start=1):
-            wait_until(lambda: window.load_status_label.text() == f"Loading {window.image_key_labels[key]} ({task}/3)")
-            assert window.load_progress_bar.value() == (task - 1) * 100 // 3
+            task_number = (task - 1) * 5 + 1
+            wait_until(lambda: window.load_status_label.text() == f"Task {task_number}/15: Loading image - {window.image_key_labels[key]}")
+            assert window.load_progress_bar.value() == (3, 37, 70)[task - 1]
             assert window.cancel_load_button.isVisible()
             assert not window.load_images_button.isEnabled()
             assert window.load_images_button.toolTip().endswith("(image loading is in progress)")
@@ -618,12 +656,12 @@ def test_cancel_loading_preserves_previous_data_and_tab_states(window, monkeypat
     original_load = image_data_colour.load_from_path
     calls = []
 
-    def paused_load(image, path, check_cancelled=None):
+    def paused_load(image, path, check_cancelled=None, progress=None):
         calls.append(image.key)
         started.set()
         if not release.wait(5):
             raise RuntimeError("Timed out waiting for test")
-        return original_load(image, path, check_cancelled=check_cancelled)
+        return original_load(image, path, check_cancelled=check_cancelled, progress=progress)
 
     monkeypatch.setattr(image_data_colour, "load_from_path", paused_load)
     window.load_images_button.click()
@@ -702,7 +740,7 @@ def test_cancel_loading_does_not_hide_worker_error(window, monkeypatch, image_pa
     release = threading.Event()
     errors = []
 
-    def failing_load(image, path, check_cancelled=None):
+    def failing_load(image, path, check_cancelled=None, progress=None):
         started.set()
         if not release.wait(5):
             raise RuntimeError("Timed out waiting for test")
@@ -729,12 +767,12 @@ def test_close_waits_for_image_loading(window, monkeypatch, image_paths):
     release = threading.Event()
     original_load = image_data_colour.load_from_path
 
-    def paused_load(image, path, check_cancelled=None):
+    def paused_load(image, path, check_cancelled=None, progress=None):
         if image.key == "B1":
             started.set()
             if not release.wait(5):
                 raise RuntimeError("Timed out waiting for test")
-        return original_load(image, path, check_cancelled=check_cancelled)
+        return original_load(image, path, check_cancelled=check_cancelled, progress=progress)
 
     monkeypatch.setattr(image_data_colour, "load_from_path", paused_load)
     window.load_images_button.click()
@@ -848,8 +886,8 @@ def test_analysis_runs_off_ui_thread_and_keeps_inputs_stable(window, monkeypatch
         assert calls[0][1] is not window.analysis_options
         expected_mask = np.array([[True, False, False, False]] * 3)
         assert np.array_equal(calls[0][1].int_paper_mask, np.repeat(expected_mask[..., None], 3, axis=-1))
-        wait_until(lambda: window.analysis_progress_label.text().startswith("Task 2/4"))
-        assert window.analysis_progress_bar.value() == 25
+        wait_until(lambda: window.analysis_progress_label.text().startswith("Task 2/17"))
+        assert window.analysis_progress_bar.value() == 9
         assert not window.analyze_button.isEnabled()
         assert window.analyze_button.toolTip().endswith("(analysis is in progress)")
         assert window.tab_widget.tabToolTip(window.tab_widget.indexOf(window.load_tab)).endswith(
@@ -898,8 +936,8 @@ def test_analysis_error_restores_controls_and_allows_retry(window, monkeypatch, 
     wait_until(lambda: window._analysis_thread is None)
     assert "analysis broke" in errors[0][2]
     assert window.report.toPlainText() == "previous report"
-    assert window.analysis_progress_bar.value() == 33
-    assert window.analysis_progress_label.text() == "Analysis failed. Task 2/3: Analysing RGB colours"
+    assert window.analysis_progress_bar.value() == 15
+    assert window.analysis_progress_label.text() == "Analysis failed. Task 2/10: Analysing RGB colours"
     assert window.analyze_button.isEnabled()
     assert window.analysis_settings_group.isEnabled()
     assert window.tab_widget.isTabEnabled(window.tab_widget.indexOf(window.load_tab))
@@ -1142,28 +1180,42 @@ def test_analysis_reports_each_real_stage_and_completed_percentage(window, monke
     monkeypatch.setattr(main, "image_analysis_b1_b2_a", paused_analysis)
     window.analyze_button.click()
     try:
-        for task, description in enumerate((
+        descriptions = (
             "Calculating intersection masks",
             "Preparing masks and image data",
+            "Summarising mask data",
             "Analysing RGB colours",
+            "Analysing RGB paper: Before Image 1",
+            "Analysing RGB paper: Before Image 2",
+            "Analysing RGB paper: After Image",
+            "Analysing RGB ink: Before Image 1",
+            "Analysing RGB ink: Before Image 2",
+            "Analysing RGB ink: After Image",
             "Analysing CIELAB colours",
-        ), start=1):
-            wait_until(lambda: window.analysis_progress_label.text() == f"Task {task}/4: {description}")
-            assert window.analysis_progress_bar.value() == (task - 1) * 25
+            "Analysing CIELAB paper: Before Image 1",
+            "Analysing CIELAB paper: Before Image 2",
+            "Analysing CIELAB paper: After Image",
+            "Analysing CIELAB ink: Before Image 1",
+            "Analysing CIELAB ink: Before Image 2",
+            "Analysing CIELAB ink: After Image",
+        )
+        for task, description in enumerate(descriptions, start=1):
+            wait_until(lambda: window.analysis_progress_label.text() == f"Task {task}/17: {description}")
+            assert window.analysis_progress_bar.value() == ((2 * task - 1) * 100 + 17) // 34
             permits.release()
         wait_until(lambda: window._analysis_thread is None)
     finally:
-        for _ in range(4):
+        for _ in range(17):
             permits.release()
         if window._analysis_thread is not None:
             wait_until(lambda: window._analysis_thread is None)
 
     assert window.analysis_progress_bar.value() == 100
-    assert window.analysis_progress_label.text() == "Analysis complete (4/4 tasks)."
+    assert window.analysis_progress_label.text() == "Analysis complete (17/17 tasks)."
     assert "Overall change in RGB colour space" in window.report.toPlainText()
 
 
-@pytest.mark.parametrize(("rgb", "lab", "total"), [(False, False, 1), (True, False, 2), (False, True, 2)])
+@pytest.mark.parametrize(("rgb", "lab", "total"), [(False, False, 2), (True, False, 6), (False, True, 6)])
 def test_analysis_task_count_reflects_enabled_options(window, monkeypatch, image_paths, rgb, lab, total):
     for key, path in image_paths.items():
         select_image(window, monkeypatch, key, path)
