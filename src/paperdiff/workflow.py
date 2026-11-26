@@ -823,8 +823,8 @@ def image_analysis_b1_b2_a(
 
     if op.use_masks:
         # Get masks
-        individual_paper_mask = (not op.intersection_mask) or (op.int_paper_mask is None) or (not op.images_aligned)
-        individual_ink_mask = (not op.intersection_mask) or (op.int_ink_mask is None) or (not op.images_aligned)
+        individual_paper_mask = (not op.intersection_mask) or (op.int_paper_mask is None)
+        individual_ink_mask = (not op.intersection_mask) or (op.int_ink_mask is None)
         
         if individual_paper_mask:
             paper_mask = {

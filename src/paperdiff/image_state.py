@@ -35,7 +35,7 @@ class analysis_options:
     """Container for all analysis option settings used by the UI."""
 
     def __init__(self):
-        """Initialise analysis settings and intersection-mask state."""
+        """Initialise analysis settings and combined-mask state."""
         self.show_analysis_options = False
         self.show_image_data = False
         

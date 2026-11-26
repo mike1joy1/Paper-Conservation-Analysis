@@ -22,7 +22,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from PySide6.QtCore import QEvent, QObject, Qt, QSize, QThread, Signal, Slot
+from PySide6.QtCore import QEvent, QObject, Qt, QSize, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication,
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QColorDialog,
     QCheckBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QSizePolicy,
     QSlider,
+    QSpacerItem,
     QStyle,
     QStyleOptionTab,
     QTabBar,
@@ -184,7 +186,7 @@ class AnalysisThread(QThread):
         self.result = None
         self.error = None
         self.cancel_requested = Event()
-        self.use_intersection = mode != "single" and self.options.images_aligned and self.options.use_masks and self.options.intersection_mask
+        self.use_intersection = mode != "single" and self.options.use_masks and self.options.intersection_mask
         colour_tasks = 1 + (len(images) * (1 + int(self.options.use_masks)) if self.options.mean_comparison else 0)
         self.total_tasks = (
             2 + int(self.options.show_image_data) + int(self.use_intersection)
@@ -204,11 +206,11 @@ class AnalysisThread(QThread):
             raise AnalysisCancelled()
 
     def run(self):
-        """Compute optional intersection masks and run the analysis."""
+        """Compute optional combined masks and run the analysis."""
         try:
             self._check_cancelled()
             if self.use_intersection:
-                self._start_task("Calculating intersection masks")
+                self._start_task("Calculating combined masks")
                 self.options.int_paper_mask, self.options.int_ink_mask = _intersection_masks(
                     self.images, check_cancelled=self._check_cancelled
                 )
@@ -221,6 +223,46 @@ class AnalysisThread(QThread):
             self.result = None
         except Exception:
             self.error = traceback.format_exc()
+
+
+class MaskBatchThread(QThread):
+    """Generate or import masks for several images without accessing UI widgets."""
+
+    item_done = Signal(int, int, str, str, str)
+
+    def __init__(self, action, keys, images, paths=None, settings=None, parent=None):
+        """Snapshot the images and settings used for the batch."""
+        super().__init__(parent)
+        self.action = action
+        self.keys = list(keys)
+        self.images = images
+        self.paths = dict(paths or {})
+        self.settings = dict(settings or {})
+        self.cancel_requested = Event()
+
+    def run(self):
+        """Process each image in turn, reporting a status of ok, missing or error."""
+        total = len(self.keys)
+        for index, key in enumerate(self.keys, start=1):
+            if self.cancel_requested.is_set():
+                break
+            status, detail = "ok", ""
+            try:
+                if self.action == "generate":
+                    paper_mask, ink_mask, _border = self.images[key].generate_masks(**self.settings)
+                    if paper_mask is None or ink_mask is None:
+                        status = "skipped"
+                else:
+                    path = self.paths.get(key)
+                    if not path:
+                        status, detail = "error", "no export path is set"
+                    else:
+                        self.images[key].import_mask(path)
+            except FileNotFoundError:
+                status = "missing"
+            except Exception as exc:
+                status, detail = "error", str(exc)
+            self.item_done.emit(index, total, key, status, detail)
 
 
 class ZoomableLabel(QLabel):
@@ -448,6 +490,9 @@ class MainWindow(QMainWindow):
         self.mask_mode = "luminance"
         self._loading_thread = None
         self._close_after_loading = False
+        self._mask_batch = None
+        self._mask_thread = None
+        self._close_after_mask_batch = False
         self._analysis_thread = None
         self._close_after_analysis = False
         self._alignment_tab_visited = False
@@ -559,13 +604,11 @@ class MainWindow(QMainWindow):
         ):
             return "select Reference colour mask generation"
         if widget is self.intersection_mask_checkbox:
-            if not self.analysis_options.use_masks and not self.analysis_options.images_aligned:
-                return "enable Use masks and Aligned image mode first"
-            if not self.analysis_options.use_masks:
-                return "enable Use masks in Analysis first"
-            return "enable Aligned image mode first"
+            if self.image_mode != "single" and not self._images_have_identical_resolution():
+                return "images must have the same resolution"
+            return "enable Use masks in Analysis first"
         if widget is self.per_pixel_comparison_checkbox:
-            return "enable Intersection mask or turn off Use masks"
+            return "enable Combined mask or turn off Use masks"
         if widget in (self.heatmap_grid_slider_x, self.heatmap_grid_slider_y):
             return "enable Per-pixel comparison first"
         return "unavailable"
@@ -599,6 +642,12 @@ class MainWindow(QMainWindow):
         if self._analysis_thread is not None:
             self._close_after_analysis = True
             self.analysis_progress_label.setText("Analysis is finishing; the window will close when it is done.")
+            event.ignore()
+            return
+        if self._mask_thread is not None:
+            self._close_after_mask_batch = True
+            self._mask_thread.cancel_requested.set()
+            self.mask_progress_label.setText("Mask processing is finishing; the window will close when it is done.")
             event.ignore()
             return
         super().closeEvent(event)
@@ -818,14 +867,16 @@ class MainWindow(QMainWindow):
             label, short = self.image_key_labels[key], short_labels[key]
             active = key in self._active_image_keys()
             button = self.load_select_buttons[key]
-            button.setText(f"Select {label}" if active else "No image")
+            button.setText("Select image" if active else "No image")
+            self.load_card_titles[key].setText(label if active else "No image")
+            self.mask_card_titles[key].setText(label if active else "No image")
             self._base_control_tooltips[button] = f"Select and preview {label}; load the selected images afterwards."
             if not active or not self.selected_image_paths[key]:
                 self.load_preview_labels[key].setText(label if active else "No image")
             self.alignment_buttons[key].setText(short)
             self._base_control_tooltips[self.alignment_buttons[key]] = f"Show {label} in the alignment preview."
-            self.mask_generate_buttons[key].setText(f"Generate mask for {short}" if active else "Generate mask")
-            self.mask_remove_buttons[key].setText(f"Remove mask for {short}" if active else "Remove mask")
+            self.mask_generate_buttons[key].setText("Generate mask")
+            self.mask_remove_buttons[key].setText("Remove mask")
             for widget, tooltip in (
                 (self.paper_colour_buttons[key], f"Choose the paper reference colour for {label}."),
                 (self.ink_colour_buttons[key], f"Choose the ink reference colour for {label}."),
@@ -1055,17 +1106,62 @@ class MainWindow(QMainWindow):
             if self._close_after_loading:
                 self.close()
 
+    def _split_tab(self, page):
+        """Lay out a tab as a fixed 250 px settings column on the left and content on the right."""
+        page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        columns = QHBoxLayout(page)
+        settings = QWidget()
+        settings.setFixedWidth(250)
+        settings_layout = QVBoxLayout(settings)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setAlignment(Qt.AlignTop)
+        content_frame = QFrame()
+        content_frame.setObjectName("tabViewport")
+        content_frame.setStyleSheet(
+            "#tabViewport { background: palette(base); border: 1px solid palette(mid); border-radius: 6px; }"
+        )
+        content_layout = QVBoxLayout(content_frame)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        columns.addWidget(settings)
+        columns.addWidget(content_frame, 1)
+        return settings_layout, content_layout
+
+    def _button_row(self, *buttons):
+        """Lay buttons out side by side in equal halves, keeping each half's width when its partner is hidden."""
+        row = QGridLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        for column, button in enumerate(buttons):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            row.addWidget(button, 0, column)
+            row.addItem(QSpacerItem(0, 0, QSizePolicy.Expanding, QSizePolicy.Minimum), 1, column)
+            row.setColumnStretch(column, 1)
+        return row
+
+    def _make_card_title(self, text):
+        """Create the bold title shown at the top of an image card."""
+        title = QLabel(text)
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-weight: bold; font-size: 13px; border: none; background: transparent;")
+        return title
+
+    def _make_image_card(self):
+        """Create a bordered box holding one image and its controls."""
+        card = QFrame()
+        card.setObjectName("imageCard")
+        card.setStyleSheet(
+            "#imageCard { background: palette(window); border: 1px solid palette(mid); border-radius: 6px; }"
+        )
+        return card
+
     def _create_load_tab(self):
         """Tab 1: select, preview, and load the configured images."""
         page = QWidget()
-        page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-        layout = QVBoxLayout(page)
-        layout.setAlignment(Qt.AlignTop)
+        layout, content = self._split_tab(page)
 
         self.image_configuration_group = QGroupBox("Images to compare")
-        self.image_configuration_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        configuration_layout = QHBoxLayout(self.image_configuration_group)
-        configuration_layout.setSpacing(18)
+        self.image_configuration_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        configuration_layout = QVBoxLayout(self.image_configuration_group)
         self.image_configuration_buttons = QButtonGroup(page)
         self.image_mode_buttons = {}
         for mode, text in (
@@ -1075,7 +1171,6 @@ class MainWindow(QMainWindow):
             ("two_after", "1 before, 2 after"),
         ):
             button = QRadioButton(text)
-            button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             button.setToolTip("Analyse one image." if mode == "single" else f"Compare {text}.")
             self.image_configuration_buttons.addButton(button)
             configuration_layout.addWidget(button)
@@ -1084,10 +1179,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.image_configuration_group)
 
         input_group = self.load_image_type_group = QGroupBox("Image type")
-        input_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        input_group.setMaximumHeight(120)
-        input_group.setMaximumWidth(260)
-        input_layout = QHBoxLayout(input_group)
+        input_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        input_layout = QVBoxLayout(input_group)
         self.image_type_group = QButtonGroup(page)
         self.colour_radio = QRadioButton("Colour images")
         self.colour_radio.setToolTip("Use colour photographs for the comparison.")
@@ -1106,17 +1199,22 @@ class MainWindow(QMainWindow):
         self.path_labels = {}
         self.image_details_labels = {}
         self.load_image_cards = {}
+        self.load_card_titles = {}
         self.image_key_labels = {"B1": "Before Image 1", "B2": "Before Image 2", "A": "After Image"}
         grid = QGridLayout()
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(10)
 
         for col, key in enumerate(["B1", "B2", "A"]):
-            card = QWidget()
+            card = self._make_image_card()
             card.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             card_layout = QVBoxLayout(card)
             card_layout.setContentsMargins(8, 8, 8, 8)
             card_layout.setSpacing(6)
+
+            title = self._make_card_title(self.image_key_labels[key])
+            self.load_card_titles[key] = title
+            card_layout.addWidget(title)
 
             preview_label = QLabel(self.image_key_labels[key])
             preview_label.setAlignment(Qt.AlignCenter)
@@ -1125,7 +1223,7 @@ class MainWindow(QMainWindow):
             preview_label.setStyleSheet("border: 1px solid #888; background: #262626;")
             card_layout.addWidget(preview_label)
 
-            button = QPushButton(f"Select {self.image_key_labels[key]}")
+            button = QPushButton("Select image")
             button.setToolTip(f"Select and preview {self.image_key_labels[key]}; load the selected images afterwards.")
             button.clicked.connect(lambda checked, value=key: self._open_image_for_key(value))
             button.setFixedHeight(30)
@@ -1152,7 +1250,8 @@ class MainWindow(QMainWindow):
             grid.addWidget(card, 0, col)
             grid.setColumnStretch(col, 1)
 
-        layout.addLayout(grid)
+        content.addLayout(grid)
+        content.addStretch(1)
         self.load_images_button = QPushButton("Load images")
         self.load_images_button.setToolTip("Load and prepare the selected images for analysis.")
         self.load_images_button.setEnabled(False)
@@ -1162,11 +1261,7 @@ class MainWindow(QMainWindow):
         self.cancel_load_button.setStyleSheet(CANCEL_BUTTON_STYLE)
         self.cancel_load_button.clicked.connect(self.cancel_loading)
         self.cancel_load_button.hide()
-        button_row = QHBoxLayout()
-        button_row.addWidget(self.load_images_button)
-        button_row.addWidget(self.cancel_load_button)
-        button_row.addStretch(1)
-        layout.addLayout(button_row)
+        layout.addLayout(self._button_row(self.load_images_button, self.cancel_load_button))
         self.load_progress_bar = QProgressBar()
         self.load_progress_bar.setRange(0, 100)
         self.load_progress_bar.setValue(0)
@@ -1177,7 +1272,7 @@ class MainWindow(QMainWindow):
         return page
 
     def _get_intersection_masks_for_alignment(self):
-        """Return the intersection paper and ink masks across all loaded images when alignment mode is enabled."""
+        """Return the combined paper and ink masks across all loaded images."""
         return _intersection_masks({key: self.images[key] for key in self._active_image_keys()})
 
     def _display_alignment_image(self):
@@ -1201,9 +1296,6 @@ class MainWindow(QMainWindow):
                 self._preview_from_array(self.alignment_preview, image)
                 return
         else:
-            self.analysis_options.int_paper_mask = None
-            self.analysis_options.int_ink_mask = None
-            self.analysis_options.intersection_mask = False
             paper_mask = image_data.masks.get("paper")
             ink_mask = image_data.masks.get("ink")
             if paper_mask is None or ink_mask is None:
@@ -1275,6 +1367,7 @@ class MainWindow(QMainWindow):
         self.alignment_checkbox.setEnabled(available)
         if not available:
             self.alignment_checkbox.setChecked(False)
+        self._refresh_analysis_options_state()
 
     def _update_alignment_buttons(self):
         """Mark the currently displayed image in the alignment selector."""
@@ -1297,14 +1390,12 @@ class MainWindow(QMainWindow):
     def _create_check_alignment_tab(self):
         """Create the tab for visually inspecting alignment between images."""
         page = QWidget()
-        page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-        layout = QVBoxLayout(page)
-        layout.setAlignment(Qt.AlignTop)
+        layout, content = self._split_tab(page)
 
-        self.alignment_checkbox = QCheckBox("Aligned image mode")
+        self.alignment_checkbox = QCheckBox("Combined mask")
         self.alignment_checkbox.setToolTip(
-            "Treat the images as already aligned and preview their shared mask areas. "
-            "All selected images must have the same resolution."
+            "Display the masks combined across all selected images (pixels included in every image's mask). "
+            "Display only; all selected images must have the same resolution."
         )
         self.alignment_checkbox.setChecked(False)
         self.alignment_checkbox.setEnabled(False)
@@ -1312,15 +1403,13 @@ class MainWindow(QMainWindow):
         self.alignment_checkbox.toggled.connect(
             lambda checked: (
                 self.analysis_options.sync_from_ui(images_aligned=checked),
-                self._refresh_analysis_options_state(),
                 self._display_alignment_image(),
             )
         )
-        layout.addWidget(self.alignment_checkbox)
 
-        view_group = QGroupBox("Alignment view")
+        view_group = QGroupBox("Mask display")
         view_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        view_layout = QHBoxLayout(view_group)
+        view_layout = QVBoxLayout(view_group)
         self.alignment_mode_group = QButtonGroup(page)
         self.original_radio = QRadioButton("Original")
         self.original_radio.setToolTip("Show the selected image without a mask overlay.")
@@ -1343,19 +1432,15 @@ class MainWindow(QMainWindow):
         self.masked_ink_radio.toggled.connect(lambda checked: self._set_alignment_mode("ink_mask") if checked else None)
         for radio in [self.original_radio, self.mask_radio, self.masked_paper_radio, self.masked_ink_radio]:
             view_layout.addWidget(radio)
-        layout.addWidget(view_group)
-
         self.overlay_button = QPushButton(f"Mask overlay colour: {self.mask_overlay_colour.name()}")
         self.overlay_button.setToolTip("Choose the colour used for pixels outside the selected mask.")
         self.overlay_button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.overlay_button.clicked.connect(self._choose_mask_overlay_colour)
         self._update_overlay_button_style()
         self._update_alignment_mode_availability()
-        overlay_row = QHBoxLayout()
-        overlay_row.setAlignment(Qt.AlignLeft)
-        overlay_row.addWidget(self.overlay_button)
-        overlay_row.addStretch(1)
-        layout.addLayout(overlay_row)
+        view_layout.addWidget(self.alignment_checkbox)
+        view_layout.addWidget(self.overlay_button)
+        layout.addWidget(view_group)
 
         button_row = QHBoxLayout()
         button_row.setAlignment(Qt.AlignLeft)
@@ -1384,8 +1469,8 @@ class MainWindow(QMainWindow):
         selector_row.addLayout(button_row)
         selector_row.addStretch(1)
         selector_row.addWidget(self.reset_alignment_zoom_button)
-        layout.addLayout(selector_row)
-        layout.addWidget(self.alignment_preview)
+        content.addLayout(selector_row)
+        content.addWidget(self.alignment_preview)
 
         self._update_alignment_buttons()
         self._refresh_alignment_preview()
@@ -1496,10 +1581,10 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "change_all_paper_button"):
             self.change_all_paper_button.setStyleSheet("")
-            self.change_all_paper_button.setText("Set all paper colours")
+            self.change_all_paper_button.setText("Set paper colours")
         if hasattr(self, "change_all_ink_button"):
             self.change_all_ink_button.setStyleSheet("")
-            self.change_all_ink_button.setText("Set all ink colours")
+            self.change_all_ink_button.setText("Set ink colours")
 
     def _generate_mask_for_key(self, key: str):
         """Create separate paper and ink masks and keep the red border out of both."""
@@ -1529,11 +1614,116 @@ class MainWindow(QMainWindow):
         self._update_mask_file_controls()
         self._display_alignment_image()
 
+    def _start_mask_batch(self, action, keys, paths=None):
+        """Run a mask batch on a worker thread, updating the progress bar as each image finishes."""
+        if self._mask_thread is not None:
+            return
+        keys = list(keys)
+        title = "Generating masks" if action == "generate" else "Importing masks"
+        if not keys:
+            return
+        settings = {
+            "mode": self.mask_mode,
+            "threshold": self.mask_threshold_slider.value(),
+            "reference_weight": self.reference_weight_slider.value() / 100.0,
+            "border_pixels": self.mask_border_slider.value(),
+        }
+        thread = MaskBatchThread(action, keys, self.images, paths=paths, settings=settings, parent=self)
+        thread.item_done.connect(self._mask_item_done)
+        thread.finished.connect(self._mask_batch_finished)
+        self._mask_thread = thread
+        self._mask_batch = {
+            "action": action, "title": title, "done": 0, "total": len(keys),
+            "imported": [], "missing": [], "errors": [],
+            "buttons": {
+                button: button.isEnabled()
+                for button in (self.generate_all_masks_button, self.auto_import_masks_button)
+            },
+        }
+        for button in self._mask_batch["buttons"]:
+            button.setEnabled(False)
+        self.cancel_mask_batch_button.setEnabled(True)
+        self.cancel_mask_batch_button.show()
+        self.mask_progress_bar.setValue(0)
+        self.mask_progress_label.setText(f"{title}: 0/{len(keys)}")
+        thread.start()
+
+    def _cancel_mask_batch(self):
+        """Request cancellation of the running mask batch after the current image."""
+        if self._mask_thread is None:
+            return
+        self._mask_thread.cancel_requested.set()
+        self.cancel_mask_batch_button.setEnabled(False)
+        self.mask_progress_label.setText("Cancelling...")
+
+    def _mask_item_done(self, done, total, key, status, detail):
+        """Refresh the previews and progress for one finished image."""
+        batch = self._mask_batch
+        if batch is None:
+            return
+        label = self.alignment_buttons[key].text()
+        image_data = self.images[key]
+        if status == "ok":
+            batch["imported"].append(label)
+            if batch["action"] == "generate":
+                if image_data.masks.get("ink") is not None:
+                    self._display_mask_preview(
+                        self.mask_preview_labels[key],
+                        paper_mask=image_data.masks.get("paper"),
+                        ink_mask=image_data.masks.get("ink"),
+                        border_mask=image_data.mask_border,
+                    )
+            else:
+                self._display_mask_preview(
+                    self.mask_preview_labels[key],
+                    paper_mask=image_data.masks["paper"],
+                    ink_mask=image_data.masks["ink"],
+                )
+            self._update_mask_file_controls()
+            self._display_alignment_image()
+        elif status == "missing":
+            batch["missing"].append(label)
+        elif status == "error":
+            batch["errors"].append(f"{label}: {detail}")
+        batch["done"] = done
+        self.mask_progress_bar.setValue(done * 100 // total)
+        self.mask_progress_label.setText(f"{batch['title']}: {done}/{total}")
+
+    def _mask_batch_finished(self):
+        """Restore the controls and report the outcome once the worker thread has stopped."""
+        thread, batch = self._mask_thread, self._mask_batch
+        self._mask_thread = None
+        self._mask_batch = None
+        if thread is not None:
+            thread.deleteLater()
+        if batch is None:
+            return
+        self.cancel_mask_batch_button.hide()
+        for button, enabled in batch["buttons"].items():
+            button.setEnabled(enabled)
+        total = batch["total"]
+        cancelled = batch["done"] < total
+        if cancelled:
+            self.mask_progress_label.setText(f"{batch['title']} cancelled ({batch['done']}/{total} done).")
+        else:
+            self.mask_progress_bar.setValue(100)
+            self.mask_progress_label.setText(f"{batch['title']} complete ({total}/{total}).")
+        if batch["action"] == "import":
+            details = [f"Imported: {', '.join(batch['imported']) if batch['imported'] else 'none'}."]
+            if batch["missing"]:
+                details.append(f"No mask found: {', '.join(batch['missing'])}.")
+            if batch["errors"]:
+                details.append("Import failed:\n" + "\n".join(batch["errors"]))
+                QMessageBox.warning(self, "Auto-import masks", "\n".join(details))
+            else:
+                QMessageBox.information(self, "Auto-import masks", "\n".join(details))
+        if self._close_after_mask_batch:
+            self.close()
+
     def _generate_mask_for_all(self):
         """Generate masks for all images currently loaded into the app."""
-        for key in self._active_image_keys():
-            if self.images[key].pixels.get("rgb") is not None:
-                self._generate_mask_for_key(key)
+        keys = [key for key in self._active_image_keys() if self.images[key].pixels.get("rgb") is not None]
+        self._start_mask_batch("generate", keys)
 
     def _remove_mask_for_key(self, key: str):
         """Clear the saved mask for a single image, leaving the original image visible."""
@@ -1577,33 +1767,9 @@ class MainWindow(QMainWindow):
         self._display_alignment_image()
 
     def _auto_import_masks(self):
-        """Import available masks from configured export paths and report outcomes."""
-        imported = []
-        missing = []
-        errors = []
-        for key in self._active_image_keys():
-            path = self.mask_export_paths[key]
-            label = self.alignment_buttons[key].text()
-            if not path:
-                errors.append(f"{label}: no export path is set")
-            else:
-                try:
-                    self._import_mask_from_path(key, path)
-                except FileNotFoundError:
-                    missing.append(label)
-                except (OSError, ValueError, Image.DecompressionBombError) as exc:
-                    errors.append(f"{label} ({path}): {exc}")
-                else:
-                    imported.append(label)
-
-        details = [f"Imported: {', '.join(imported) if imported else 'none'}."]
-        if missing:
-            details.append(f"No mask found: {', '.join(missing)}.")
-        if errors:
-            details.append("Import failed:\n" + "\n".join(errors))
-            QMessageBox.warning(self, "Auto-import masks", "\n".join(details))
-        else:
-            QMessageBox.information(self, "Auto-import masks", "\n".join(details))
+        """Import available masks from the configured export paths on a worker thread."""
+        keys = self._active_image_keys()
+        self._start_mask_batch("import", keys, paths={key: self.mask_export_paths[key] for key in keys})
 
     def _set_mask_export_path_for_key(self, key: str):
         """Choose and validate the PNG export destination for one image."""
@@ -1687,7 +1853,7 @@ class MainWindow(QMainWindow):
             return
 
         for key, button in self.mask_generate_buttons.items():
-            button.setText(f"Generate mask for {key}")
+            button.setText("Generate mask")
 
     def _set_mask_controls_enabled(self, enabled: bool):
         """Enable or disable the whole mask section without overriding the active mode rules."""
@@ -1758,15 +1924,7 @@ class MainWindow(QMainWindow):
     def _create_mask_tab(self):
         """Create the tab for preparing and previewing paper and ink masks."""
         page = QWidget()
-        page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-        layout = QVBoxLayout(page)
-        layout.setAlignment(Qt.AlignTop)
-
-        self.use_mask_checkbox = QCheckBox("Use mask")
-        self.use_mask_checkbox.setToolTip("Enable mask generation and allow masks to be used in the analysis.")
-        self.use_mask_checkbox.setChecked(False)
-        self.use_mask_checkbox.toggled.connect(lambda checked: self._set_mask_controls_enabled(checked))
-        layout.addWidget(self.use_mask_checkbox)
+        layout, content = self._split_tab(page)
 
         settings_group = QGroupBox("Mask settings")
         settings_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
@@ -1774,10 +1932,13 @@ class MainWindow(QMainWindow):
         settings_layout.setSpacing(6)
         settings_layout.setContentsMargins(8, 8, 8, 8)
 
-        mode_group = QGroupBox("Mask generation")
-        mode_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        mode_group.setMaximumWidth(320)
-        mode_layout = QHBoxLayout(mode_group)
+        self.use_mask_checkbox = QCheckBox("Use mask")
+        self.use_mask_checkbox.setToolTip("Enable mask generation and allow masks to be used in the analysis.")
+        self.use_mask_checkbox.setChecked(False)
+        self.use_mask_checkbox.toggled.connect(lambda checked: self._set_mask_controls_enabled(checked))
+        settings_layout.addWidget(self.use_mask_checkbox)
+
+        self._add_options_heading(settings_layout, "Threshold type")
         self.mask_mode_group = QButtonGroup(page)
         self.luminance_radio = QRadioButton("Luminance")
         self.luminance_radio.setToolTip("Separate ink and paper using an image brightness threshold.")
@@ -1788,9 +1949,10 @@ class MainWindow(QMainWindow):
         self.mask_mode_group.addButton(self.colour_radio)
         self.luminance_radio.toggled.connect(lambda checked: self._set_mask_mode("luminance") if checked else None)
         self.colour_radio.toggled.connect(lambda checked: self._set_mask_mode("reference_colour") if checked else None)
-        mode_layout.addWidget(self.luminance_radio)
-        mode_layout.addWidget(self.colour_radio)
-        settings_layout.addWidget(mode_group)
+        settings_layout.addWidget(self.luminance_radio)
+        settings_layout.addWidget(self.colour_radio)
+
+        self._add_options_heading(settings_layout, "Luminance")
 
         self.mask_threshold_slider = QSlider(Qt.Horizontal)
         self.mask_threshold_slider.setToolTip(
@@ -1807,6 +1969,8 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.mask_threshold_label)
         settings_layout.addLayout(self._slider_with_editor(self.mask_threshold_slider, 80))
 
+        self._add_options_heading(settings_layout, "Reference colour")
+        reference_colour_row_index = settings_layout.count()
         self.reference_weight_slider = QSlider(Qt.Horizontal)
         self.reference_weight_slider.setToolTip(
             "Adjust the balance between paper and ink reference colours; higher values favour paper."
@@ -1822,6 +1986,7 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.reference_weight_label)
         settings_layout.addLayout(self._slider_with_editor(self.reference_weight_slider, 50, divisor=100))
 
+        self._add_options_heading(settings_layout, "Border")
         self.mask_border_slider = QSlider(Qt.Horizontal)
         self.mask_border_slider.setToolTip("Set how many pixels to exclude from mask boundaries.")
         self.mask_border_slider.setRange(0, 20)
@@ -1848,14 +2013,20 @@ class MainWindow(QMainWindow):
         self.mask_export_path_fields = {}
         self.mask_export_paths = {}
         self.mask_image_cards = {}
+        self.mask_card_titles = {}
         grid = QGridLayout()
         grid.setAlignment(Qt.AlignTop)
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(8)
         for col, key in enumerate(["B1", "B2", "A"]):
-            card = QWidget()
+            card = self._make_image_card()
+            card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
             card_layout = QVBoxLayout(card)
             card_layout.setSpacing(3)
+
+            title = self._make_card_title(self.image_key_labels[key])
+            self.mask_card_titles[key] = title
+            card_layout.addWidget(title)
 
             original_preview = ZoomableLabel(f"Original {key}")
             original_preview.setAlignment(Qt.AlignCenter)
@@ -1882,11 +2053,11 @@ class MainWindow(QMainWindow):
             colour_row.addWidget(ink_button)
             card_layout.addLayout(colour_row)
 
-            button = QPushButton(f"Generate mask for {key}")
+            button = QPushButton("Generate mask")
             button.setToolTip(f"Generate paper and ink masks for {self.image_key_labels[key]} using the current settings.")
             button.setMinimumWidth(120)
             button.clicked.connect(lambda checked, value=key: self._generate_mask_for_key(value))
-            remove_button = QPushButton(f"Remove mask for {key}")
+            remove_button = QPushButton("Remove mask")
             remove_button.setToolTip(f"Remove the generated masks for {self.image_key_labels[key]}.")
             remove_button.setMinimumWidth(120)
             remove_button.clicked.connect(lambda checked, value=key: self._remove_mask_for_key(value))
@@ -1906,7 +2077,9 @@ class MainWindow(QMainWindow):
             file_row.addWidget(export_button)
             card_layout.addLayout(file_row)
 
-            export_path_button = QPushButton("Set export path")
+            export_path_button = QPushButton("🗀")
+            export_path_button.setStyleSheet("font-weight: bold;")
+            export_path_button.setFixedWidth(32)
             export_path_button.setToolTip(f"Choose the mask export folder and filename for {self.image_key_labels[key]}.")
             export_path_button.clicked.connect(lambda checked, value=key: self._set_mask_export_path_for_key(value))
             export_path_field = QLineEdit()
@@ -1915,8 +2088,8 @@ class MainWindow(QMainWindow):
             export_path_field.setToolTip(f"Current mask export path for {self.image_key_labels[key]}.")
             export_path_field.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             path_row = QHBoxLayout()
-            path_row.addWidget(export_path_button)
             path_row.addWidget(export_path_field)
+            path_row.addWidget(export_path_button)
             card_layout.addLayout(path_row)
 
             self.mask_original_labels[key] = original_preview
@@ -1933,42 +2106,52 @@ class MainWindow(QMainWindow):
             self.mask_image_cards[key] = card
             grid.addWidget(card, 0, col)
 
-        self.change_all_paper_button = QPushButton("Set all paper colours")
+        self.change_all_paper_button = QPushButton("Set paper colours")
         self.change_all_paper_button.setToolTip("Set the same paper reference colour for all selected images.")
         self.change_all_paper_button.setMinimumWidth(180)
         self.change_all_paper_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.change_all_paper_button.clicked.connect(lambda: self._change_all_reference_colours("paper"))
-        self.change_all_ink_button = QPushButton("Set all ink colours")
+        self.change_all_ink_button = QPushButton("Set ink colours")
         self.change_all_ink_button.setToolTip("Set the same ink reference colour for all selected images.")
         self.change_all_ink_button.setMinimumWidth(180)
         self.change_all_ink_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.change_all_ink_button.clicked.connect(lambda: self._change_all_reference_colours("ink"))
 
-        self.generate_all_masks_button = QPushButton("Generate masks for all")
+        self.generate_all_masks_button = QPushButton("Generate masks")
         self.generate_all_masks_button.setToolTip("Generate paper and ink masks for all loaded images.")
         self.generate_all_masks_button.setMinimumWidth(180)
         self.generate_all_masks_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.generate_all_masks_button.clicked.connect(self._generate_mask_for_all)
 
-        self.export_all_masks_button = QPushButton("Export all masks")
+        self.export_all_masks_button = QPushButton("Export masks")
         self.export_all_masks_button.setToolTip("Export each mask to its configured path, confirming before overwriting.")
         self.export_all_masks_button.clicked.connect(self._export_all_masks)
-        self.auto_import_masks_button = QPushButton("Auto-import masks")
+        self.auto_import_masks_button = QPushButton("Import masks")
         self.auto_import_masks_button.setToolTip("Import masks found at the configured export paths for all images.")
         self.auto_import_masks_button.clicked.connect(self._auto_import_masks)
 
-        bulk_actions_row = QHBoxLayout()
-        bulk_actions_row.setContentsMargins(0, 0, 0, 0)
-        bulk_actions_row.setAlignment(Qt.AlignLeft)
-        bulk_actions_row.addWidget(self.change_all_paper_button)
-        bulk_actions_row.addWidget(self.change_all_ink_button)
-        bulk_actions_row.addWidget(self.generate_all_masks_button)
-        bulk_actions_row.addWidget(self.export_all_masks_button)
-        bulk_actions_row.addWidget(self.auto_import_masks_button)
-        bulk_actions_row.addStretch(1)
-        settings_layout.addLayout(bulk_actions_row)
+        self.cancel_mask_batch_button = QPushButton("Cancel")
+        self.cancel_mask_batch_button.setToolTip("Stop after the image currently being processed.")
+        self.cancel_mask_batch_button.setStyleSheet(CANCEL_BUTTON_STYLE)
+        self.cancel_mask_batch_button.clicked.connect(self._cancel_mask_batch)
+        self.cancel_mask_batch_button.hide()
 
-        layout.addLayout(grid)
+        self.mask_progress_bar = QProgressBar()
+        self.mask_progress_bar.setRange(0, 100)
+        self.mask_progress_bar.setValue(0)
+        self.mask_progress_label = QLabel("")
+        self.mask_progress_label.setWordWrap(True)
+
+        settings_layout.insertLayout(
+            reference_colour_row_index, self._button_row(self.change_all_paper_button, self.change_all_ink_button)
+        )
+        layout.addLayout(self._button_row(self.export_all_masks_button, self.auto_import_masks_button))
+        layout.addLayout(self._button_row(self.generate_all_masks_button, self.cancel_mask_batch_button))
+        layout.addWidget(self.mask_progress_bar)
+        layout.addWidget(self.mask_progress_label)
+
+        content.addLayout(grid)
+        content.addStretch(1)
         self._update_reference_colour_buttons()
         self._update_mask_generation_button_text()
         self._set_mask_controls_enabled(self.use_mask_checkbox.isChecked())
@@ -2127,7 +2310,9 @@ class MainWindow(QMainWindow):
             slider.blockSignals(False)
             slider.sync_editor()
 
-        intersection_enabled = options.use_masks and options.images_aligned
+        intersection_enabled = (
+            options.use_masks and self.image_mode != "single" and self._images_have_identical_resolution()
+        )
         per_pixel_enabled = self.image_mode != "single" and not (options.use_masks and not options.intersection_mask)
         heatmap_enabled = options.per_pixel_comparison and per_pixel_enabled
 
@@ -2333,9 +2518,10 @@ class MainWindow(QMainWindow):
         self._add_options_heading(options_layout, "Masks")
         options_layout.addWidget(self.use_masks_checkbox)
 
-        self.intersection_mask_checkbox = QCheckBox("Intersection mask")
+        self.intersection_mask_checkbox = QCheckBox("Combined mask")
         self.intersection_mask_checkbox.setToolTip(
-            "Compare only pixels included in the corresponding mask in all selected aligned images."
+            "Compare only pixels included in the corresponding mask in all selected images. "
+            "Requires all images to have the same resolution."
         )
         self.intersection_mask_checkbox.setChecked(self.analysis_options.intersection_mask)
         self.intersection_mask_checkbox.toggled.connect(
@@ -2405,7 +2591,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.analysis_settings_group)
         self.analyze_button = QPushButton("Analyse")
         self.analyze_button.setToolTip("Run the selected analysis on the loaded images.")
-        self.analyze_button.setFixedWidth(170)
         self.analyze_button.clicked.connect(self.analyze_images)
         self.cancel_analysis_button = QPushButton("Cancel analysis")
         self.cancel_analysis_button.setToolTip(
@@ -2414,11 +2599,7 @@ class MainWindow(QMainWindow):
         self.cancel_analysis_button.setStyleSheet(CANCEL_BUTTON_STYLE)
         self.cancel_analysis_button.clicked.connect(self.cancel_analysis)
         self.cancel_analysis_button.hide()
-        button_row = QHBoxLayout()
-        button_row.addWidget(self.analyze_button)
-        button_row.addWidget(self.cancel_analysis_button)
-        button_row.addStretch(1)
-        layout.addLayout(button_row)
+        layout.addLayout(self._button_row(self.analyze_button, self.cancel_analysis_button))
         self.analysis_progress_bar = QProgressBar()
         self.analysis_progress_bar.setRange(0, 100)
         self.analysis_progress_bar.setValue(0)
