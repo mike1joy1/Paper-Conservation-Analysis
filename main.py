@@ -22,8 +22,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from PySide6.QtCore import QEvent, QObject, Qt, QSize, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QImage, QPainter, QPixmap, QFontDatabase
+from PySide6.QtCore import QEvent, QObject, QRectF, Qt, QSize, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QScrollArea,
 )
 
 from paperdiff.image_state import analysis_options, image_data_colour, mask_to_colour_image
@@ -459,6 +460,275 @@ class ClickableLabel(ZoomableLabel):
     pass
 
 
+class CardGridArea(QScrollArea):
+    """Vertically scrolling area that lays fixed-size cards out in as many columns as fit."""
+
+    SPACING = 10
+    MARGIN = 10
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cards = []
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setFrameShape(QFrame.NoFrame)
+        # Transparent via autofill rather than stylesheets, which would restyle the cards' native controls.
+        self.viewport().setAutoFillBackground(False)
+        self._container = QWidget()
+        self._container.setAutoFillBackground(False)
+        self._grid = QGridLayout(self._container)
+        self._grid.setSpacing(self.SPACING)
+        self._grid.setContentsMargins(self.MARGIN, self.MARGIN, self.MARGIN, self.MARGIN)
+        self._grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.setWidget(self._container)
+        self._container.setAutoFillBackground(False)
+
+    def add_card(self, card):
+        """Append a card and re-flow the grid."""
+        self._cards.append(card)
+        card.setParent(self._container)
+        card.show()
+        self._reflow()
+
+    def remove_card(self, card):
+        """Remove a card and re-flow the grid."""
+        if card in self._cards:
+            self._cards.remove(card)
+            self._grid.removeWidget(card)
+            card.deleteLater()
+            self._reflow()
+
+    def cards(self):
+        """Return the cards in grid order."""
+        return list(self._cards)
+
+    def move_card(self, card, step):
+        """Move a card one place earlier (-1) or later (+1); return whether it moved."""
+        index = self._cards.index(card)
+        target = index + step
+        if not 0 <= target < len(self._cards):
+            return False
+        self._cards[index], self._cards[target] = self._cards[target], self._cards[index]
+        self._reflow()
+        return True
+
+    def _reflow(self):
+        if not self._cards:
+            return
+        card_width = self._cards[0].width()
+        available = self.viewport().width() - 2 * self.MARGIN
+        columns = max(1, (available + self.SPACING) // (card_width + self.SPACING))
+        for card in self._cards:
+            self._grid.removeWidget(card)
+        for index, card in enumerate(self._cards):
+            self._grid.addWidget(card, index // columns, index % columns)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow()
+
+
+class ImageCardWidget(QFrame):
+    """A reusable image card widget with before/after selection checkboxes and removal button.
+    
+    For load tab: displays an image with before/after classification.
+    For mask tab: displays masks and generation/import controls.
+    """
+    
+    removed = Signal(str)  # emits the image_id when remove button is clicked
+    before_toggled = Signal(str, bool)  # emits (image_id, is_before)
+    after_toggled = Signal(str, bool)  # emits (image_id, is_after)
+    load_requested = Signal(str)  # emits the image_id when its load button is clicked
+    move_requested = Signal(str, int)  # emits (image_id, -1 for left / +1 for right)
+    
+    PREVIEW_WIDTH = 234
+    PREVIEW_HEIGHT = 176  # 4:3
+
+    def __init__(self, image_id: str, pixmap=None, parent=None, filename: str = "", details: str = ""):
+        """Initialize the card with an ID and optional preview pixmap.
+        
+        Args:
+            image_id: Unique identifier for this image
+            pixmap: QPixmap to display (optional for first setup)
+            parent: Parent widget
+        """
+        super().__init__(parent)
+        self.image_id = image_id
+        self.setObjectName("imageCard")
+        self._loaded = False
+        # Painted manually (no stylesheet) so child checkboxes and buttons keep the native app styling.
+        self.setFixedSize(250, 350)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        
+        header = QHBoxLayout()
+        self.filename_label = QLabel(filename)
+        self.filename_label.setStyleSheet("font-weight: bold; font-size: 13px; border: none; background: transparent;")
+        self.filename_label.setToolTip(filename)
+        self.filename_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.filename_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        header.addWidget(self.filename_label, 1)
+        self.remove_button = QPushButton("✕")
+        self.remove_button.setFlat(True)
+        self.remove_button.setFixedSize(20, 20)
+        self.remove_button.setCursor(Qt.PointingHandCursor)
+        self.remove_button.setStyleSheet(
+            "QPushButton { border: none; background: transparent; font-size: 14px; font-weight: bold; }"
+            "QPushButton:hover { color: #c0392b; }"
+        )
+        self.remove_button.setToolTip("Remove this image")
+        self.remove_button.clicked.connect(self._on_remove_clicked)
+        header.addWidget(self.remove_button)
+        layout.addLayout(header)
+        
+        # Image preview (4:3, image fully contained)
+        self.preview_label = QLabel()
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setFixedSize(self.PREVIEW_WIDTH, self.PREVIEW_HEIGHT)
+        self.preview_label.setStyleSheet("border: 1px solid #888; background: #262626;")
+        self.set_pixmap(pixmap)
+        layout.addWidget(self.preview_label)
+
+        path_text, _, info_text = details.partition("\n")
+        details_box = QVBoxLayout()
+        details_box.setSpacing(4)
+        details_box.setContentsMargins(0, 0, 0, 0)
+        self.details_label = QLabel(path_text)
+        self.info_label = QLabel(info_text)
+        for label in (self.details_label, self.info_label):
+            label.setWordWrap(True)
+            label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+            label.setStyleSheet("font-size: 11px; border: none; background: transparent;")
+            label.setToolTip(details)
+            details_box.addWidget(label)
+        details_box.addStretch(1)
+        layout.addLayout(details_box, 1)
+        
+        # Before/After checkboxes and per-card load button
+        checkbox_layout = QHBoxLayout()
+        self.before_checkbox = QCheckBox("Before")
+        self.before_checkbox.setToolTip("Mark this as a before image")
+        self.before_checkbox.toggled.connect(lambda checked: self.before_toggled.emit(self.image_id, checked))
+        checkbox_layout.addWidget(self.before_checkbox)
+        
+        self.after_checkbox = QCheckBox("After")
+        self.after_checkbox.setToolTip("Mark this as an after image")
+        self.after_checkbox.toggled.connect(lambda checked: self.after_toggled.emit(self.image_id, checked))
+        checkbox_layout.addWidget(self.after_checkbox)
+
+        checkbox_layout.addStretch(1)
+        self.load_button = QPushButton("Load")
+        self.load_button.setToolTip("Load this image for analysis (tick Before or After first).")
+        self.load_button.setEnabled(False)
+        self.load_button.clicked.connect(lambda: self.load_requested.emit(self.image_id))
+        checkbox_layout.addWidget(self.load_button)
+        layout.addLayout(checkbox_layout)
+
+        arrow_layout = QHBoxLayout()
+        self.left_button = QPushButton("◀")
+        self.left_button.setToolTip("Move this image earlier in the order")
+        self.left_button.clicked.connect(lambda: self.move_requested.emit(self.image_id, -1))
+        self.right_button = QPushButton("▶")
+        self.right_button.setToolTip("Move this image later in the order")
+        self.right_button.clicked.connect(lambda: self.move_requested.emit(self.image_id, 1))
+        for button in (self.left_button, self.right_button):
+            button.setFixedWidth(40)
+        arrow_layout.addWidget(self.left_button)
+        arrow_layout.addStretch(1)
+        arrow_layout.addWidget(self.right_button)
+        layout.addLayout(arrow_layout)
+        # Ticking one box unticks the other; both may be unticked.
+        self.before_checkbox.toggled.connect(lambda checked: checked and self.after_checkbox.setChecked(False))
+        self.after_checkbox.toggled.connect(lambda checked: checked and self.before_checkbox.setChecked(False))
+        self.before_checkbox.toggled.connect(lambda _checked: self.update())
+        self.after_checkbox.toggled.connect(lambda _checked: self.update())
+
+    def set_loaded(self, loaded: bool):
+        """Show a green border while the image is loaded for analysis."""
+        self._loaded = loaded
+        self.update()
+
+    def paintEvent(self, event):
+        """Draw the card background and border."""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        palette = self.palette()
+
+        def blend(amount):
+            """Mix the window colour towards the text colour so card colours follow light/dark themes."""
+            base, text = palette.window().color(), palette.windowText().color()
+            return QColor(
+                *(int(b + (t - b) * amount) for b, t in zip(base.getRgb()[:3], text.getRgb()[:3]))
+            )
+
+        selected = self.before_checkbox.isChecked() or self.after_checkbox.isChecked()
+        width = 2 if self._loaded else 1
+        if self._loaded:
+            colour = QColor("#2e9e44")
+        elif selected:
+            colour = blend(0.6)
+        else:
+            colour = blend(0.25)
+        pen = QPen(colour)
+        pen.setWidth(width)
+        painter.setPen(pen)
+        painter.setBrush(palette.window().color() if selected or self._loaded else blend(0.07))
+        half = width / 2
+        painter.drawRoundedRect(QRectF(half, half, self.width() - width, self.height() - width), 6, 6)
+    
+    def set_pixmap(self, pixmap):
+        """Update the displayed image, scaled to fit entirely inside the 4:3 box."""
+        if pixmap and not pixmap.isNull():
+            inner = QSize(self.PREVIEW_WIDTH - 2, self.PREVIEW_HEIGHT - 2)
+            self.preview_label.setPixmap(pixmap.scaled(inner, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    
+    def set_before(self, checked: bool, block_signals=False):
+        """Set the before checkbox state."""
+        with self._block_signals_context(self.before_checkbox) if block_signals else self._no_op_context():
+            self.before_checkbox.setChecked(checked)
+    
+    def set_after(self, checked: bool, block_signals=False):
+        """Set the after checkbox state."""
+        with self._block_signals_context(self.after_checkbox) if block_signals else self._no_op_context():
+            self.after_checkbox.setChecked(checked)
+    
+    def is_before(self) -> bool:
+        """Check if marked as before."""
+        return self.before_checkbox.isChecked()
+    
+    def is_after(self) -> bool:
+        """Check if marked as after."""
+        return self.after_checkbox.isChecked()
+    
+    def _on_remove_clicked(self):
+        """Emit removal signal."""
+        self.removed.emit(self.image_id)
+    
+    @staticmethod
+    def _block_signals_context(widget):
+        """Context manager to temporarily block signals."""
+        class SignalBlocker:
+            def __enter__(self):
+                widget.blockSignals(True)
+                return self
+            def __exit__(self, *args):
+                widget.blockSignals(False)
+        return SignalBlocker()
+    
+    @staticmethod
+    def _no_op_context():
+        """No-op context manager."""
+        class NoOp:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+        return NoOp()
+
+
 class AnalysisTabBar(QTabBar):
     def initStyleOption(self, option: QStyleOptionTab, tab_index: int):
         """Suppress hover styling for disabled tabs."""
@@ -496,6 +766,22 @@ class MainWindow(QMainWindow):
         self._analysis_thread = None
         self._close_after_analysis = False
         self._alignment_tab_visited = False
+        
+        # New dynamic image selection model
+        self.loaded_images = {}  # {image_id: {"path": str, "pixmap": QPixmap, "is_before": bool, "is_after": bool}}
+        self.load_image_cards = {}  # {image_id: ImageCardWidget}
+        self.slot_cards = {}  # {"B1"/"B2"/"A": image_id} for images currently loaded
+        self._pending_plan = ("one_each", {})
+        self._pending_new = {}
+        self.mask_image_cards = {}  # {image_id: MaskImageCardWidget}
+        self.next_image_id = 0  # Counter for generating unique IDs
+        
+        # Keep image_key_labels for backward compatibility with mask tab and other UI elements
+        self.image_key_labels = {
+            "B1": "Before Image 1",
+            "B2": "Before Image 2",
+            "A": "After Image",
+        }
 
         self.tab_widget = QTabWidget()
         original_tab_bar = self.tab_widget.tabBar()
@@ -534,8 +820,6 @@ class MainWindow(QMainWindow):
         for index in range(1, self.tab_widget.count()):
             self.tab_widget.setTabEnabled(index, False)
 
-        for mode, button in self.image_mode_buttons.items():
-            button.toggled.connect(lambda checked, value=mode: self._set_image_mode(value) if checked else None)
         self._base_control_tooltips = {
             widget: widget.toolTip()
             for tab in self._base_tab_tooltips
@@ -559,58 +843,79 @@ class MainWindow(QMainWindow):
 
     def _disabled_control_reason(self, widget):
         """Describe the current prerequisite for a disabled control."""
-        if widget is self.normal_map_radio:
+        if hasattr(self, 'normal_map_radio') and widget is self.normal_map_radio:
             return "normal map analysis is not yet available"
-        if widget is self.cancel_load_button or widget is self.cancel_analysis_button:
+        if hasattr(self, 'cancel_load_button') and widget is self.cancel_load_button:
+            return "cancellation is in progress"
+        if hasattr(self, 'cancel_analysis_button') and widget is self.cancel_analysis_button:
             return "cancellation is in progress"
         if self._loading_thread is not None:
             return "image loading is in progress"
         if self._analysis_thread is not None:
             return "analysis is in progress"
 
+        # Check for alignment and card widgets (old system compatibility)
         for key in ("B2", "A"):
-            if key not in self._active_image_keys() and (
-                widget is self.alignment_buttons[key]
-                or any(card is widget or card.isAncestorOf(widget)
-                       for card in (self.load_image_cards[key], self.mask_image_cards[key]))
-            ):
-                return ("only one image is selected" if self.image_mode == "single"
-                        else "only one before and one after image are selected")
+            if hasattr(self, 'alignment_buttons') and key not in self._active_image_keys():
+                if key in self.alignment_buttons and widget is self.alignment_buttons[key]:
+                    return ("only one image is selected" if self.image_mode == "single"
+                            else "only one before and one after image are selected")
+                if key in self.load_image_cards and (widget is self.load_image_cards[key] or self.load_image_cards[key].isAncestorOf(widget)):
+                    return ("only one image is selected" if self.image_mode == "single"
+                            else "only one before and one after image are selected")
+                if key in self.mask_image_cards and (widget is self.mask_image_cards[key] or self.mask_image_cards[key].isAncestorOf(widget)):
+                    return ("only one image is selected" if self.image_mode == "single"
+                            else "only one before and one after image are selected")
 
         for tab in self._base_tab_tooltips:
             if tab.isAncestorOf(widget) and not self.tab_widget.isTabEnabled(self.tab_widget.indexOf(tab)):
                 return self._disabled_tab_reason(tab)
 
-        if widget is self.load_images_button:
+        if hasattr(self, 'load_images_button') and widget is self.load_images_button:
             if self.image_mode == "single":
                 return "select an image first"
             return "select all three images first" if self.image_mode != "one_each" else "select both images first"
-        if self.image_mode == "single" and widget in (
-            self.alignment_checkbox, self.intersection_mask_checkbox, self.per_pixel_comparison_checkbox
-        ):
-            return "comparison requires at least two images"
-        if widget is self.alignment_checkbox:
+        
+        if hasattr(self, 'alignment_checkbox') and widget is self.alignment_checkbox:
+            if self.image_mode == "single":
+                return "comparison requires at least two images"
             return "images must have the same resolution"
-        if (self.mask_tab.isAncestorOf(widget) or widget is self.use_masks_checkbox) and not self.use_mask_checkbox.isChecked():
-            return "enable Use mask on the Mask tab first"
-        if widget is self.mask_threshold_slider:
-            return "select Luminance mask generation"
-        if widget in (
-            self.reference_weight_slider,
-            self.change_all_paper_button,
-            self.change_all_ink_button,
-            *self.paper_colour_buttons.values(),
-            *self.ink_colour_buttons.values(),
-        ):
-            return "select Reference colour mask generation"
-        if widget is self.intersection_mask_checkbox:
+        
+        if hasattr(self, 'intersection_mask_checkbox') and widget is self.intersection_mask_checkbox:
+            if self.image_mode == "single":
+                return "comparison requires at least two images"
             if self.image_mode != "single" and not self._images_have_identical_resolution():
                 return "images must have the same resolution"
             return "enable Use masks in Analysis first"
-        if widget is self.per_pixel_comparison_checkbox:
+        
+        if hasattr(self, 'per_pixel_comparison_checkbox') and widget is self.per_pixel_comparison_checkbox:
+            if self.image_mode == "single":
+                return "comparison requires at least two images"
             return "enable Combined mask or turn off Use masks"
-        if widget in (self.heatmap_grid_slider_x, self.heatmap_grid_slider_y):
-            return "enable Per-pixel comparison first"
+        
+        if (self.mask_tab.isAncestorOf(widget) or (hasattr(self, 'use_masks_checkbox') and widget is self.use_masks_checkbox)) and hasattr(self, 'use_mask_checkbox') and not self.use_mask_checkbox.isChecked():
+            return "enable Use mask on the Mask tab first"
+        
+        if hasattr(self, 'mask_threshold_slider') and widget is self.mask_threshold_slider:
+            return "select Luminance mask generation"
+        
+        if hasattr(self, 'reference_weight_slider') and widget in (
+            self.reference_weight_slider,
+            self.change_all_paper_button if hasattr(self, 'change_all_paper_button') else None,
+            self.change_all_ink_button if hasattr(self, 'change_all_ink_button') else None,
+        ):
+            if widget is not None:
+                return "select Reference colour mask generation"
+        
+        if hasattr(self, 'paper_colour_buttons'):
+            if widget in self.paper_colour_buttons.values() or widget in self.ink_colour_buttons.values():
+                return "select Reference colour mask generation"
+        
+        if hasattr(self, 'heatmap_grid_slider_x') and widget in (self.heatmap_grid_slider_x if hasattr(self, 'heatmap_grid_slider_x') else None, 
+                                                                    self.heatmap_grid_slider_y if hasattr(self, 'heatmap_grid_slider_y') else None):
+            if widget is not None:
+                return "enable Per-pixel comparison first"
+        
         return "unavailable"
 
     def _refresh_disabled_tooltips(self):
@@ -653,15 +958,11 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _refresh_preview_box_sizes(self):
-        """Keep the small preview cards and the alignment viewer scaled by the current window size, without forcing fixed internal viewport dimensions."""
+        """Keep the mask preview cards and the alignment viewer scaled by the current window size, without forcing fixed internal viewport dimensions."""
         available_width = max(240, self.width() - 180)
         thumb_width = max(180, min(360, int(available_width / 3)))
         available_height = max(180, self.height() - 300)
         thumb_height = max(90, min(int(thumb_width * 0.55), available_height))
-
-        if hasattr(self, "load_preview_labels"):
-            for label in self.load_preview_labels.values():
-                label.setMinimumWidth(80)
 
         if hasattr(self, "alignment_preview"):
             self.alignment_preview.setMinimumSize(200, 120)
@@ -786,7 +1087,9 @@ class MainWindow(QMainWindow):
             file_size = file_path.stat().st_size
             with Image.open(file_path) as image:
                 width, height = image.size
-                bits = getattr(image, "bits", "unknown")
+                bits = getattr(image, "bits", None)
+                if bits is None:
+                    bits = {"1": 1, "I": 32, "F": 32}.get(image.mode, 16 if image.mode.startswith("I;16") else 8)
                 format_name = (image.format or file_path.suffix.lstrip(".") or "unknown").lower()
                 return f"{width} × {height}px • {bits}-bit • {format_name} • {self._format_file_size(file_size)}"
         except Exception:
@@ -829,107 +1132,32 @@ class MainWindow(QMainWindow):
         return ("B1", "A") if self.image_mode == "one_each" else ("B1", "B2", "A")
 
     def _set_image_mode(self, mode):
-        """Update slot labels and invalidate loaded data when the configuration changes."""
+        """Update image mode and related internal state.
+        
+        Note: In the new system, image mode is determined automatically based on
+        how many before/after images the user selects during loading.
+        """
         if mode == self.image_mode:
             return
-        previous_mode = self.image_mode
-        if mode == "single":
-            self._saved_after_preview = QPixmap(self.load_preview_labels["A"].pixmap())
-            self.load_preview_labels["A"].setText("No image")
-            self.path_labels["A"].setText("Not used")
-            self.image_details_labels["A"].setText("No image details")
-        elif previous_mode == "single":
-            path = self.selected_image_paths["A"]
-            if path:
-                self.load_preview_labels["A"].setPixmap(self._saved_after_preview)
-                self.path_labels["A"].setText(path)
-                self.image_details_labels["A"].setText(self._image_file_details(path))
-            else:
-                self.path_labels["A"].setText("No file selected")
         self.image_mode = mode
-        self.selected_image_paths["B2"] = ""
-        self.path_labels["B2"].setText("No file selected")
-        self.image_details_labels["B2"].setText("No image details")
-        self.load_preview_labels["B2"].clear()
-        self.image_key_labels = {
-            "single": {"B1": "Image", "B2": "the middle image", "A": "the after image"},
-            "two_before": {"B1": "Before Image 1", "B2": "Before Image 2", "A": "After Image"},
-            "one_each": {"B1": "Before Image", "B2": "the middle image", "A": "After Image"},
-            "two_after": {"B1": "Before Image", "B2": "After Image 1", "A": "After Image 2"},
-        }[mode]
-        short_labels = {
-            "single": {"B1": "Image", "B2": "No image", "A": "No image"},
-            "two_before": {"B1": "B1", "B2": "B2", "A": "A"},
-            "one_each": {"B1": "B", "B2": "No image", "A": "A"},
-            "two_after": {"B1": "B", "B2": "A1", "A": "A2"},
-        }[mode]
-        for key in ("B1", "B2", "A"):
-            label, short = self.image_key_labels[key], short_labels[key]
-            active = key in self._active_image_keys()
-            button = self.load_select_buttons[key]
-            button.setText("Select image" if active else "No image")
-            self.load_card_titles[key].setText(label if active else "No image")
-            self.mask_card_titles[key].setText(label if active else "No image")
-            self._base_control_tooltips[button] = f"Select and preview {label}; load the selected images afterwards."
-            if not active or not self.selected_image_paths[key]:
-                self.load_preview_labels[key].setText(label if active else "No image")
-            self.alignment_buttons[key].setText(short)
-            self._base_control_tooltips[self.alignment_buttons[key]] = f"Show {label} in the alignment preview."
-            self.mask_generate_buttons[key].setText("Generate mask")
-            self.mask_remove_buttons[key].setText("Remove mask")
-            for widget, tooltip in (
-                (self.paper_colour_buttons[key], f"Choose the paper reference colour for {label}."),
-                (self.ink_colour_buttons[key], f"Choose the ink reference colour for {label}."),
-                (self.mask_generate_buttons[key], f"Generate paper and ink masks for {label} using the current settings."),
-                (self.mask_remove_buttons[key], f"Remove the generated masks for {label}."),
-                (self.mask_import_buttons[key], f"Import a colour mask for {label}."),
-                (self.mask_export_buttons[key], f"Export the mask for {label} as a PNG image."),
-                (self.mask_export_path_buttons[key], f"Choose the mask export folder and filename for {label}."),
-                (self.mask_export_path_fields[key], f"Current mask export path for {label}."),
-            ):
-                self._base_control_tooltips[widget] = tooltip
-            self.load_image_cards[key].setEnabled(active)
-            self.mask_image_cards[key].setEnabled(active)
-            self.alignment_buttons[key].setEnabled(active)
-            if key != "B2" and active:
-                if self.mask_original_labels[key]._base_pixmap.isNull():
-                    self.mask_original_labels[key].setText(f"Original {short}")
-                if self.mask_preview_labels[key].pixmap().isNull():
-                    self.mask_preview_labels[key].setText(f"Mask {short}")
-            elif key != "B2":
-                self.mask_original_labels[key].clear()
-                self.mask_original_labels[key].setText("No image")
-                self.mask_preview_labels[key].clear()
-                self.mask_preview_labels[key].setText("No image")
-        self.mask_original_labels["B2"].clear()
-        self.mask_preview_labels["B2"].clear()
-        if mode in ("one_each", "single"):
-            self.mask_original_labels["B2"].setText("No image")
-            self.mask_preview_labels["B2"].setText("No image")
-        else:
-            short = short_labels["B2"]
-            self.mask_original_labels["B2"].setText(f"Original {short}")
-            self.mask_preview_labels["B2"].setText(f"Mask {short}")
-        if mode == "single":
+        
+        # Update the analysis settings text based on mode
+        if hasattr(self, 'analysis_settings_group'):
+            self.analysis_settings_group.setTitle("Analysis settings" if mode == "single" else "Comparison settings")
+        
+        for widget, single_text, comparison_text in (
+            (self.rgb_comparison_checkbox, "sRGB analysis", "sRGB comparison"),
+            (self.lab_comparison_checkbox, "CEILAB analysis", "CEILAB comparison"),
+            (self.mean_comparison_checkbox, "Mean colour statistics", "Mean comparison"),
+        ):
+            if hasattr(self, widget.objectName() if hasattr(widget, 'objectName') else ''):
+                widget.setText(single_text if mode == "single" else comparison_text)
+        
+        if mode == "single" and hasattr(self, 'alignment_checkbox'):
             self.alignment_checkbox.setChecked(False)
             self.alignment_checkbox.setEnabled(False)
-        self.image_configuration_group.setTitle("Images to analyse" if mode == "single" else "Images to compare")
-        self.analysis_settings_group.setTitle("Analysis settings" if mode == "single" else "Comparison settings")
-        for widget, single_text, comparison_text, single_tip, comparison_tip in (
-            (self.rgb_comparison_checkbox, "sRGB analysis", "sRGB comparison",
-             "Include sRGB colour statistics in the results.", "Include sRGB colour comparisons in the results."),
-            (self.lab_comparison_checkbox, "CEILAB analysis", "CEILAB comparison",
-             "Include CEILAB colour statistics in the results.", "Include CEILAB colour comparisons in the results."),
-            (self.mean_comparison_checkbox, "Mean colour statistics", "Mean comparison",
-             "Report average colours and their standard deviations.", "Compare average colours and report their differences."),
-        ):
-            widget.setText(single_text if mode == "single" else comparison_text)
-            self._base_control_tooltips[widget] = single_tip if mode == "single" else comparison_tip
-        self._base_control_tooltips[self.use_masks_checkbox] = (
-            "Analyse paper and ink separately using their masks. Enable Use mask on the Mask tab first."
-            if mode == "single" else
-            "Compare paper and ink separately using their masks. Enable Use mask on the Mask tab first."
-        )
+        
+        self._refresh_disabled_tooltips()
         self._refresh_analysis_options_state()
         self.current_alignment_view = "B1"
         self._update_alignment_buttons()
@@ -1007,35 +1235,225 @@ class MainWindow(QMainWindow):
         self.analysis_progress_bar.setValue(0)
         self.analysis_progress_label.setText("Load the selected images before analysis.")
 
+    def _map_slots(self, before_ids, after_ids):
+        """Map ordered before/after image ids to the fixed B1/B2/A slots; return (mode, slots) or None if unsupported."""
+        nb, na = len(before_ids), len(after_ids)
+        if nb > 2 or na > 2 or (nb == 2 and na == 2):
+            return None
+        slots = {}
+        if nb == 2:
+            mode = "two_before"
+            slots["B1"], slots["B2"] = before_ids
+            if na:
+                slots["A"] = after_ids[0]
+        elif na == 2:
+            mode = "two_after"
+            if nb:
+                slots["B1"] = before_ids[0]
+            slots["B2"], slots["A"] = after_ids
+        else:
+            mode = "one_each"
+            if nb:
+                slots["B1"] = before_ids[0]
+            if na:
+                slots["A"] = after_ids[0]
+        return mode, slots
+
+    def _clear_slot(self, key):
+        """Discard the loaded data for one fixed slot."""
+        self.images[key] = image_data_colour(key)
+        self.images[key].reference_colours = self.mask_reference_colours[key]
+        self.mask_original_labels[key].clear()
+        self.mask_original_labels[key].setText("No image")
+        self.mask_preview_labels[key].clear()
+        self.mask_preview_labels[key].setText("No image")
+        self.mask_export_paths[key] = ""
+        self.mask_export_path_fields[key].clear()
+
+    def _invalidate_analysis(self):
+        """Disable everything downstream of image loading until a complete set is loaded."""
+        self.analyze_button.setEnabled(False)
+        self.analysis_progress_bar.setValue(0)
+        self.analysis_progress_label.setText("Load the selected images before analysis.")
+        self.report.clear()
+        for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab, self.image_results_tab):
+            self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
+
+    def _refresh_card_loaded_state(self):
+        """Show the green border on cards whose images are currently loaded."""
+        loaded_ids = set(self.slot_cards.values())
+        for image_id, card in self.load_image_cards.items():
+            card.set_loaded(image_id in loaded_ids)
+
+    def _ordered_ids(self, image_ids):
+        """Return the given image ids in the order their cards appear in the grid."""
+        wanted = set(image_ids)
+        return [card.image_id for card in self.image_cards_area.cards() if card.image_id in wanted]
+
+    def _reslot(self, mode, new_slots, new_items=None):
+        """Re-assign already loaded images to B1/B2/A without reloading them.
+
+        `new_items` maps image ids to (image_data, pixmap, export_path) for images that were just loaded.
+        """
+        items = {}
+        for slot, image_id in self.slot_cards.items():
+            items[image_id] = (
+                self.images[slot],
+                self.mask_original_labels[slot]._base_pixmap,
+                self.mask_export_paths[slot],
+            )
+        items.update(new_items or {})
+
+        for slot in ("B1", "B2", "A"):
+            if slot not in new_slots:
+                self._clear_slot(slot)
+                continue
+            image_data, pixmap, export_path = items[new_slots[slot]]
+            image_data.key = slot
+            self.images[slot] = image_data
+            self.mask_reference_colours[slot] = image_data.reference_colours
+            self.selected_image_paths[slot] = image_data.file_path
+            self.mask_original_labels[slot].setPixmap(pixmap, preserve_zoom=True)
+            self.mask_export_paths[slot] = export_path
+            self.mask_export_path_fields[slot].setText(export_path)
+            preview = self.mask_preview_labels[slot]
+            if image_data.masks.get("ink") is not None and image_data.masks.get("paper") is not None:
+                self._display_mask_preview(
+                    preview,
+                    paper_mask=image_data.masks.get("paper"),
+                    ink_mask=image_data.masks.get("ink"),
+                    border_mask=image_data.mask_border,
+                )
+            else:
+                preview.clear()
+                preview.setText(f"Mask {slot}")
+        self.image_mode = mode
+        self.slot_cards = dict(new_slots)
+
+    def _publish_loaded_state(self):
+        """Enable analysis and the downstream tabs when a complete set is loaded, otherwise lock them."""
+        self._refresh_card_loaded_state()
+        self._update_load_tab_state()
+        self.report.clear()
+        self.analysis_progress_bar.setValue(0)
+        for tab in (self.image_results_tab,):
+            self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
+        if not self._images_ready():
+            self._invalidate_analysis()
+            return
+        self._update_reference_colour_buttons()
+        self._update_mask_file_controls()
+        self._update_alignment_mode_availability()
+        self._display_alignment_image()
+        self.status_label.setText("Images loaded. Run the analysis to create a report.")
+        self.analyze_button.setEnabled(True)
+        self.analysis_progress_label.setText("Ready to analyse.")
+        for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab):
+            self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), True)
+
+    def _unload_card(self, image_id):
+        """Drop a loaded image (for example when it is removed or reclassified); the others keep their data."""
+        if image_id not in self.slot_cards.values():
+            return
+        remaining = self._ordered_ids(i for i in self.slot_cards.values() if i != image_id)
+        before_ids = [i for i in remaining if self.loaded_images[i]["is_before"]]
+        after_ids = [i for i in remaining if self.loaded_images[i]["is_after"]]
+        mode, slots = self._map_slots(before_ids, after_ids)
+        self._reslot(mode, slots)
+        self._publish_loaded_state()
+
+    def _on_card_move_requested(self, image_id, step):
+        """Move a card left or right in the grid and re-order the loaded images to match, without reloading."""
+        if self._loading_thread is not None or not self.image_cards_area.move_card(self.load_image_cards[image_id], step):
+            return
+        self._update_load_tab_state()
+        if not self.slot_cards:
+            return
+        loaded = self._ordered_ids(self.slot_cards.values())
+        before_ids = [i for i in loaded if self.loaded_images[i]["is_before"]]
+        after_ids = [i for i in loaded if self.loaded_images[i]["is_after"]]
+        mode, slots = self._map_slots(before_ids, after_ids)
+        if slots != self.slot_cards:
+            self._reslot(mode, slots)
+            self._publish_loaded_state()
+
+    def _on_card_load_requested(self, image_id):
+        """Load one image into its slot, keeping any other images that are already loaded."""
+        if self._loading_thread is not None or image_id in self.slot_cards.values():
+            return
+        order = self._ordered_ids([*self.slot_cards.values(), image_id])
+        before_ids = [i for i in order if self.loaded_images[i]["is_before"]]
+        after_ids = [i for i in order if self.loaded_images[i]["is_after"]]
+        mapping = self._map_slots(before_ids, after_ids)
+        if mapping is None:
+            QMessageBox.warning(
+                self,
+                "Unsupported combination",
+                "Loading this image would exceed the supported combinations:\n"
+                "- 1 before, 1 after\n- 2 before, 1 after\n- 1 before, 2 after\n\n"
+                "Remove a loaded image (untick it or click X) first.",
+            )
+            return
+        self._start_loading(mapping[0], mapping[1], f"Loading {Path(self.loaded_images[image_id]['path']).name}...")
+
     def _load_selected_images(self):
-        """Start loading the selected set without blocking the UI."""
+        """Start loading all ticked before/after images, replacing anything already loaded."""
         if self._loading_thread is not None:
             return
-        if not all(self.selected_image_paths[key] for key in self._active_image_keys()):
-            QMessageBox.warning(self, "Missing input", "Select all required images before loading.")
-            return
 
-        self._reset_loaded_data()
+        ordered = self._ordered_ids(self.loaded_images)
+        before_ids = [i for i in ordered if self.loaded_images[i]["is_before"]]
+        after_ids = [i for i in ordered if self.loaded_images[i]["is_after"]]
+        if not before_ids or not after_ids:
+            QMessageBox.warning(
+                self, "Invalid selection", "Select at least one before image and one after image before loading."
+            )
+            return
+        mapping = self._map_slots(before_ids, after_ids)
+        if mapping is None:
+            QMessageBox.warning(
+                self,
+                "Unsupported combination",
+                f"The combination of {len(before_ids)} before and {len(after_ids)} after images is not supported.\n\n"
+                "Supported combinations:\n- 1 before, 1 after\n- 2 before, 1 after\n- 1 before, 2 after",
+            )
+            return
+        for key in ("B1", "B2", "A"):
+            self._clear_slot(key)
+        self.slot_cards = {}
+        self._invalidate_analysis()
+        self._refresh_card_loaded_state()
+        self._start_loading(mapping[0], mapping[1], "Loading images...")
+
+    def _start_loading(self, mode, slots, status_text):
+        """Load every image in `slots` that is not already loaded; the rest are re-slotted when loading finishes."""
+        self._pending_plan = (mode, dict(slots))
+        loaded_ids = set(self.slot_cards.values())
+        self._pending_new = {key: image_id for key, image_id in slots.items() if image_id not in loaded_ids}
+        paths = {key: self.loaded_images[image_id]["path"] for key, image_id in self._pending_new.items()}
+
         for index in range(1, self.tab_widget.count()):
             self.tab_widget.setTabEnabled(index, False)
-        self.load_image_type_group.setEnabled(False)
-        self.image_configuration_group.setEnabled(False)
-        for button in self.load_select_buttons.values():
-            button.setEnabled(False)
+        self.upload_button.setEnabled(False)
         self.load_images_button.setEnabled(False)
+        for card in self.load_image_cards.values():
+            card.load_button.setEnabled(False)
+            card.left_button.setEnabled(False)
+            card.right_button.setEnabled(False)
         self.cancel_load_button.setEnabled(True)
         self.cancel_load_button.setText("Cancel loading")
         self.cancel_load_button.show()
         self.load_progress_bar.setValue(0)
-        self.load_status_label.setText("Loading images...")
+        self.load_status_label.setText(status_text)
 
-        paths = {key: self.selected_image_paths[key] for key in self._active_image_keys()}
-        reference_colours = {key: self.images[key].reference_colours for key in paths}
+        default_colours = image_data_colour("B1").reference_colours
+        reference_colours = {key: dict(default_colours) for key in paths}
         self._loading_thread = ImageLoadingThread(paths, reference_colours, self)
         self._loading_thread.progress.connect(self._load_progress)
         self._loading_thread.finished.connect(self._load_finished)
         self._loading_thread.start()
         self._refresh_disabled_tooltips()
+
 
     def cancel_loading(self):
         """Request cooperative cancellation of the current image load."""
@@ -1046,6 +1464,7 @@ class MainWindow(QMainWindow):
         self.cancel_load_button.setText("Cancelling...")
         self.load_status_label.setText("Cancelling image loading...")
         self._refresh_disabled_tooltips()
+        self._refresh_disabled_tooltips()
 
     @Slot(int, int, str, str)
     def _load_progress(self, current, total, key, description):
@@ -1054,53 +1473,61 @@ class MainWindow(QMainWindow):
             return
         self.load_progress_bar.setValue(((2 * current - 1) * 100 + total) // (2 * total))
         suffix = " (closing when finished)" if self._close_after_loading else ""
-        self.load_status_label.setText(f"Task {current}/{total}: {description} - {self.image_key_labels[key]}{suffix}")
+        self.load_status_label.setText(f"Task {current}/{total}: {description} - {key}{suffix}")
 
     def _load_finished(self):
         """Publish a successful image set or restore controls after cancellation or failure."""
         thread = self._loading_thread
         self._loading_thread = None
-        self.load_image_type_group.setEnabled(True)
-        self.image_configuration_group.setEnabled(True)
-        for button in self.load_select_buttons.values():
-            button.setEnabled(True)
-        self.load_images_button.setEnabled(all(self.selected_image_paths[key] for key in self._active_image_keys()))
+        self.upload_button.setEnabled(True)
+        self._update_load_tab_state()
         self.cancel_load_button.hide()
         try:
             if thread.error is not None:
                 self.load_status_label.setText("Loading failed. Check the selected files and try again.")
-                label = self.alignment_buttons[thread.current_key].text()
-                QMessageBox.critical(self, "Image loading failed", f"Unable to load {label}:\n{thread.error}")
+                image_key = thread.current_key
+                QMessageBox.critical(self, "Image loading failed", f"Unable to load {image_key}:\n{thread.error}")
+                self._restore_if_ready()
                 return
             if thread.cancel_requested.is_set():
                 self.load_status_label.setText("Image loading cancelled.")
+                self._restore_if_ready()
                 return
 
-            pixmaps = {key: QPixmap.fromImage(image) for key, image in thread.previews.items()}
-            self.images.update(thread.images)
-            for key, pixmap in pixmaps.items():
-                self.mask_original_labels[key].setPixmap(pixmap, preserve_zoom=True)
-                self.mask_preview_labels[key].clear()
-                self.mask_preview_labels[key].setText(f"Mask {self.alignment_buttons[key].text()}")
-                image_path = Path(self.images[key].file_path)
-                self.mask_export_paths[key] = str(image_path.with_name(f"{image_path.stem}_mask.png"))
-                self.mask_export_path_fields[key].setText(self.mask_export_paths[key])
-            self._update_mask_file_controls()
-            self._update_alignment_mode_availability()
-            self._display_alignment_image()
-            self.report.clear()
-            self.status_label.setText("Images loaded. Run the analysis to create a report.")
+            mode, slots = self._pending_plan
+            new_items = {}
+            for key, image_id in self._pending_new.items():
+                image_data = thread.images[key]
+                image_path = Path(image_data.file_path)
+                new_items[image_id] = (
+                    image_data,
+                    QPixmap.fromImage(thread.previews[key]),
+                    str(image_path.with_name(f"{image_path.stem}_mask.png")),
+                )
+            self._reslot(mode, slots, new_items)
+            self.load_progress_bar.setValue(100)
+            self._publish_loaded_state()
+            if not self._images_ready():
+                self.load_status_label.setText("Image loaded. Load the remaining before/after images to continue.")
+                return
             count = len(self._active_image_keys())
             self.load_status_label.setText(f"Images loaded ({count}/{count}).")
-            self.load_progress_bar.setValue(100)
+        finally:
+            self._refresh_disabled_tooltips()
+            thread.deleteLater()
+            if self._close_after_loading:
+                self.close()
+
+    def _images_ready(self):
+        """Return whether every slot needed by the current mode holds a loaded image."""
+        return all(self._ensure_image_loaded_for_key(key) for key in self._active_image_keys())
+
+    def _restore_if_ready(self):
+        """Re-enable downstream tabs after a failed or cancelled load if the previous set is still complete."""
+        if self.slot_cards and self._images_ready():
             self.analyze_button.setEnabled(True)
-            self.analysis_progress_bar.setValue(0)
-            self.analysis_progress_label.setText("Ready to analyse.")
             for tab in (self.mask_tab, self.check_alignment_tab, self.analysis_options_tab):
                 self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), True)
-            for tab in (self.image_results_tab,):
-                self.tab_widget.setTabEnabled(self.tab_widget.indexOf(tab), False)
-        finally:
             self._refresh_disabled_tooltips()
             thread.deleteLater()
             if self._close_after_loading:
@@ -1155,121 +1582,190 @@ class MainWindow(QMainWindow):
         return card
 
     def _create_load_tab(self):
-        """Tab 1: select, preview, and load the configured images."""
+        """Tab 1: select, preview, and load images with before/after classification."""
         page = QWidget()
         layout, content = self._split_tab(page)
 
-        self.image_configuration_group = QGroupBox("Images to compare")
-        self.image_configuration_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        configuration_layout = QVBoxLayout(self.image_configuration_group)
-        self.image_configuration_buttons = QButtonGroup(page)
-        self.image_mode_buttons = {}
-        for mode, text in (
-            ("single", "1 image"),
-            ("one_each", "1 before, 1 after"),
-            ("two_before", "2 before, 1 after"),
-            ("two_after", "1 before, 2 after"),
-        ):
-            button = QRadioButton(text)
-            button.setToolTip("Analyse one image." if mode == "single" else f"Compare {text}.")
-            self.image_configuration_buttons.addButton(button)
-            configuration_layout.addWidget(button)
-            self.image_mode_buttons[mode] = button
-        self.image_mode_buttons["two_before"].setChecked(True)
-        layout.addWidget(self.image_configuration_group)
+        # Left panel controls
+        self.upload_button = QPushButton("Upload images")
+        self.upload_button.setToolTip("Select one or more images to add them to the workspace.")
+        self.upload_button.clicked.connect(self._on_upload_images_clicked)
+        layout.addWidget(self.upload_button)
 
-        input_group = self.load_image_type_group = QGroupBox("Image type")
-        input_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-        input_layout = QVBoxLayout(input_group)
-        self.image_type_group = QButtonGroup(page)
-        self.colour_radio = QRadioButton("Colour images")
-        self.colour_radio.setToolTip("Use colour photographs for the comparison.")
-        self.normal_map_radio = QRadioButton("Normal maps")
-        self.normal_map_radio.setToolTip("Normal map analysis is not yet available.")
-        self.normal_map_radio.setEnabled(False) # Grey out normal mode until feature is ready
-        self.colour_radio.setChecked(True)
-        self.image_type_group.addButton(self.colour_radio)
-        self.image_type_group.addButton(self.normal_map_radio)
-        input_layout.addWidget(self.colour_radio)
-        input_layout.addWidget(self.normal_map_radio)
-        layout.addWidget(input_group)
-
-        self.load_preview_labels = {}
-        self.load_select_buttons = {}
-        self.path_labels = {}
-        self.image_details_labels = {}
-        self.load_image_cards = {}
-        self.load_card_titles = {}
-        self.image_key_labels = {"B1": "Before Image 1", "B2": "Before Image 2", "A": "After Image"}
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(10)
-
-        for col, key in enumerate(["B1", "B2", "A"]):
-            card = self._make_image_card()
-            card.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-            card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(8, 8, 8, 8)
-            card_layout.setSpacing(6)
-
-            title = self._make_card_title(self.image_key_labels[key])
-            self.load_card_titles[key] = title
-            card_layout.addWidget(title)
-
-            preview_label = QLabel(self.image_key_labels[key])
-            preview_label.setAlignment(Qt.AlignCenter)
-            preview_label.setFixedHeight(300)
-            preview_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-            preview_label.setStyleSheet("border: 1px solid #888; background: #262626;")
-            card_layout.addWidget(preview_label)
-
-            button = QPushButton("Select image")
-            button.setToolTip(f"Select and preview {self.image_key_labels[key]}; load the selected images afterwards.")
-            button.clicked.connect(lambda checked, value=key: self._open_image_for_key(value))
-            button.setFixedHeight(30)
-            card_layout.addWidget(button)
-
-            path_label = QLabel("No file selected")
-            path_label.setWordWrap(True)
-            path_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-            path_label.setAlignment(Qt.AlignTop)
-            card_layout.addWidget(path_label)
-
-            details_label = QLabel("No image details")
-            details_label.setWordWrap(True)
-            details_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
-            details_label.setAlignment(Qt.AlignLeft)
-            details_label.setStyleSheet("font-size: 10px; color: #d0d0d0;")
-            card_layout.addWidget(details_label)
-
-            self.load_preview_labels[key] = preview_label
-            self.load_select_buttons[key] = button
-            self.path_labels[key] = path_label
-            self.image_details_labels[key] = details_label
-            self.load_image_cards[key] = card
-            grid.addWidget(card, 0, col)
-            grid.setColumnStretch(col, 1)
-
-        content.addLayout(grid)
-        content.addStretch(1)
-        self.load_images_button = QPushButton("Load images")
-        self.load_images_button.setToolTip("Load and prepare the selected images for analysis.")
+        self.remove_unselected_button = QPushButton("Remove unselected")
+        self.remove_unselected_button.setToolTip("Remove all images that are not marked as before or after.")
+        self.remove_unselected_button.setEnabled(False)
+        self.remove_unselected_button.clicked.connect(self._remove_unselected_images)
+        layout.addWidget(self.remove_unselected_button)
+        layout.addSpacing(10)
+        
+        self.load_images_button = QPushButton("Load selected")
+        self.load_images_button.setToolTip("Load and prepare all selected before/after images for analysis.")
         self.load_images_button.setEnabled(False)
         self.load_images_button.clicked.connect(self._load_selected_images)
+
         self.cancel_load_button = QPushButton("Cancel loading")
-        self.cancel_load_button.setToolTip("Cancel loading between processing steps; selected image paths are retained.")
+        self.cancel_load_button.setToolTip("Cancel loading between processing steps; selected images are retained.")
         self.cancel_load_button.setStyleSheet(CANCEL_BUTTON_STYLE)
         self.cancel_load_button.clicked.connect(self.cancel_loading)
         self.cancel_load_button.hide()
         layout.addLayout(self._button_row(self.load_images_button, self.cancel_load_button))
+
+        layout.addSpacing(10)
+
         self.load_progress_bar = QProgressBar()
         self.load_progress_bar.setRange(0, 100)
         self.load_progress_bar.setValue(0)
         layout.addWidget(self.load_progress_bar)
-        self.load_status_label = QLabel("Select all three images, then click Load images.")
+
+        self.load_status_label = QLabel("Click 'Upload images' to select images, then mark them as before or after.")
         self.load_status_label.setWordWrap(True)
         layout.addWidget(self.load_status_label)
+
+        layout.addStretch(1)
+
+        # Right panel: scrollable area with wrapping image cards
+        self.image_cards_area = CardGridArea()
+        content.addWidget(self.image_cards_area)
+
+        # The shared tab frame is the only border; tint its background slightly away from the window colour.
+        frame = content.parentWidget()
+        window_colour = self.palette().window().color()
+        tint = window_colour.darker(106) if window_colour.lightness() > 128 else window_colour.lighter(120)
+        frame.setStyleSheet(
+            f"#tabViewport {{ background: {tint.name()}; border: 1px solid palette(mid); border-radius: 6px; }}"
+        )
+        content.setContentsMargins(0, 0, 0, 0)
+
+        # Selection and loaded counts sit at the bottom of the settings column
+        self.selected_count_label = QLabel("Selected - Before: 0 | After: 0")
+        self.selected_count_label.setWordWrap(True)
+        layout.addWidget(self.selected_count_label)
+        self.loaded_count_label = QLabel("Loaded - Before: 0 | After: 0")
+        self.loaded_count_label.setWordWrap(True)
+        layout.addWidget(self.loaded_count_label)
+
         return page
+    
+    def _on_upload_images_clicked(self):
+        """Open file dialog to select multiple images."""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select images to upload",
+            "",
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp)",
+        )
+        if not paths:
+            return
+        
+        for path in paths:
+            self._add_image_card(path)
+        
+        self._update_load_tab_state()
+    
+    def _add_image_card(self, file_path: str):
+        """Create and add an image card for the given file path."""
+        try:
+            with Image.open(file_path) as image:
+                image.thumbnail((468, 352))
+                rgb = image.convert("RGB")
+                data = rgb.tobytes()
+                qimage = QImage(data, rgb.width, rgb.height, rgb.width * 3, QImage.Format.Format_RGB888).copy()
+                pixmap = QPixmap.fromImage(qimage)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Image preview failed", f"Unable to load image:\n{exc}")
+            return
+
+        # Generate unique image ID
+        image_id = str(self.next_image_id)
+        self.next_image_id += 1
+
+        # Store image data
+        self.loaded_images[image_id] = {
+            "path": file_path,
+            "pixmap": pixmap,
+            "is_before": False,
+            "is_after": False,
+        }
+
+        # Create and add card
+        card = ImageCardWidget(
+            image_id,
+            pixmap,
+            self,
+            filename=Path(file_path).name,
+            details=f"{file_path}\n{self._image_file_details(file_path)}",
+        )
+        card.removed.connect(self._on_image_card_removed)
+        card.before_toggled.connect(self._on_image_before_toggled)
+        card.load_requested.connect(self._on_card_load_requested)
+        card.move_requested.connect(self._on_card_move_requested)
+        card.after_toggled.connect(self._on_image_after_toggled)
+        
+        self.load_image_cards[image_id] = card
+        self.image_cards_area.add_card(card)
+    
+    def _on_image_card_removed(self, image_id: str):
+        """Remove an image card and its data."""
+        self._unload_card(image_id)
+        if image_id in self.load_image_cards:
+            self.image_cards_area.remove_card(self.load_image_cards[image_id])
+            del self.load_image_cards[image_id]
+        
+        if image_id in self.loaded_images:
+            del self.loaded_images[image_id]
+        
+        self._update_load_tab_state()
+    
+    def _on_image_before_toggled(self, image_id: str, checked: bool):
+        """Update the before flag for an image."""
+        if image_id in self.loaded_images:
+            self.loaded_images[image_id]["is_before"] = checked
+            self._unload_card(image_id)
+            self._update_load_tab_state()
+    
+    def _on_image_after_toggled(self, image_id: str, checked: bool):
+        """Update the after flag for an image."""
+        if image_id in self.loaded_images:
+            self.loaded_images[image_id]["is_after"] = checked
+            self._unload_card(image_id)
+            self._update_load_tab_state()
+    
+    def _remove_unselected_images(self):
+        """Remove every image card that is marked as neither before nor after."""
+        if self._loading_thread is not None:
+            return
+        for image_id, data in list(self.loaded_images.items()):
+            if not data["is_before"] and not data["is_after"]:
+                self._on_image_card_removed(image_id)
+
+    def _update_load_tab_state(self):
+        """Update the load tab UI based on current image selection."""
+        # Count before and after images
+        before_count = sum(1 for img in self.loaded_images.values() if img["is_before"])
+        after_count = sum(1 for img in self.loaded_images.values() if img["is_after"])
+        total_count = len(self.loaded_images)
+        idle = self._loading_thread is None
+        self.remove_unselected_button.setEnabled(
+            idle and any(not d["is_before"] and not d["is_after"] for d in self.loaded_images.values())
+        )        
+        # Enable load button if we have at least one before and one after
+        can_load = before_count > 0 and after_count > 0
+        self.load_images_button.setEnabled(can_load and idle)
+        loaded_ids = set(self.slot_cards.values())
+        for image_id, card in self.load_image_cards.items():
+            data = self.loaded_images[image_id]
+            card.load_button.setEnabled(idle and (data["is_before"] or data["is_after"]) and image_id not in loaded_ids)
+            card.load_button.setText("Loaded" if image_id in loaded_ids else "Load")
+        ordered_cards = self.image_cards_area.cards()
+        for index, card in enumerate(ordered_cards):
+            card.left_button.setEnabled(idle and index > 0)
+            card.right_button.setEnabled(idle and index < len(ordered_cards) - 1)
+        
+        loaded_before = sum(1 for i in loaded_ids if self.loaded_images[i]["is_before"])
+        loaded_after = sum(1 for i in loaded_ids if self.loaded_images[i]["is_after"])
+        self.selected_count_label.setText(f"Selected - Before: {before_count} | After: {after_count}")
+        self.loaded_count_label.setText(f"Loaded - Before: {loaded_before} | After: {loaded_after}")
 
     def _get_intersection_masks_for_alignment(self):
         """Return the combined paper and ink masks across all loaded images."""
