@@ -1,8 +1,10 @@
 # Paper Conservation Analysis
 
-A desktop application for comparing images of paper (with ink) and reporting visible differences between reference and comparison states. Designed for paper conservation purposes.
+A desktop application for comparing images of paper (with or without ink) and reporting visible differences between reference and comparison states. Designed for paper conservation.
 
 Developed by Dr Michael Joyce at the Centre for Print Research (CFPR), University of the West of England (UWE), Bristol, UK.
+
+> **AI disclosure:** GitHub Copilot (in VS Code) was used for UI development, code completion and refactoring. However, the core backend logic was written by the author, and all AI-generated code has been reviewed and edited by the author.
 
 ## Overview
 
