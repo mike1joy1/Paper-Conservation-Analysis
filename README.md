@@ -87,4 +87,4 @@ Use **Cancel analysis** to stop a run. Cancellation takes effect between calcula
 
 
 
-> **AI disclosure:** GitHub Copilot (in VS Code) was used for UI development, code completion and refactoring. However, the core backend logic was written by the author, and all AI-generated code has been reviewed, tested and edited by the author.
+> **AI disclosure:** GitHub Copilot (in VS Code) has been used for UI development, code completion and refactoring. However, all core backend code has been written by the author and all AI-generated code has been reviewed, edited and verified by the author.
