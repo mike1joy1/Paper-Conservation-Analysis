@@ -4,8 +4,6 @@ A desktop application for comparing images of paper (with or without ink) and re
 
 Developed by Dr Michael Joyce at the Centre for Print Research (CFPR), University of the West of England (UWE), Bristol, UK.
 
-> **AI disclosure:** GitHub Copilot (in VS Code) was used for UI development, code completion and refactoring. However, the core backend logic was written by the author, and all AI-generated code has been reviewed and edited by the author.
-
 ## Overview
 
 This app is designed for a simple conservation workflow:
@@ -86,3 +84,7 @@ Image loading runs in the background. The Load images tab estimates progress at 
 Analysis runs in the background. The Analysis tab shows the current task and estimates progress at each task's midpoint, including individual image and region comparisons; tasks may take different amounts of time. Image and analysis settings cannot be changed until it finishes. Closing the window during analysis waits for the current run to finish.
 
 Use **Cancel analysis** to stop a run. Cancellation takes effect between calculation steps, and the previous report is preserved.
+
+
+
+> **AI disclosure:** GitHub Copilot (in VS Code) was used for UI development, code completion and refactoring. However, the core backend logic was written by the author, and all AI-generated code has been reviewed, tested and edited by the author.
