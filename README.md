@@ -86,5 +86,5 @@ Analysis runs in the background. The Analysis tab shows the current task and est
 Use **Cancel analysis** to stop a run. Cancellation takes effect between calculation steps, and the previous report is preserved.
 
 
+> **AI disclosure:** GitHub Copilot's agent mode in VS Code was used to build parts of the UI and for code completion and refactoring, with iteration and review by the author. All core backend logic was written by the author, and all AI-generated code has been reviewed, edited and verified by the author.
 
-> **AI disclosure:** GitHub Copilot (in VS Code) has been used for UI development, code completion and refactoring. However, all core backend code has been written by the author and all AI-generated code has been reviewed, edited and verified by the author.
